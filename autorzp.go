@@ -710,6 +710,119 @@ func generateAcceptLanguage() string {
 	return langs[randInt(0, len(langs)-1)]
 }
 
+// ─── Currency conversion ───────────────────────────────────────────────────
+// When a user selects a currency (e.g. USD) but the Razorpay payment link is
+// locked to a different currency (e.g. INR), we convert the user's amount to
+// the site's currency at the current exchange rate before charging.
+//
+// Uses the free Frankfurter API (no key required, based on ECB rates).
+// Results are cached for 1 hour to minimize API calls.
+
+var (
+	exchangeRateCache      = make(map[string]float64) // "FROM_TO" -> rate
+	exchangeRateCacheTimes = make(map[string]time.Time)
+	exchangeRateCacheMutex sync.Mutex
+)
+
+// getExchangeRate returns the exchange rate from `from` currency to `to` currency.
+// E.g. getExchangeRate("USD", "INR") might return 83.12 (1 USD = 83.12 INR).
+// Results are cached for 1 hour. Returns an error if the API call fails.
+func getExchangeRate(from, to string) (float64, error) {
+	from = strings.ToUpper(strings.TrimSpace(from))
+	to = strings.ToUpper(strings.TrimSpace(to))
+
+	if from == to {
+		return 1.0, nil
+	}
+	if from == "" || to == "" {
+		return 0, fmt.Errorf("empty currency code")
+	}
+
+	cacheKey := from + "_" + to
+
+	exchangeRateCacheMutex.Lock()
+	if rate, ok := exchangeRateCache[cacheKey]; ok {
+		if cacheTime, ctOk := exchangeRateCacheTimes[cacheKey]; ctOk && time.Since(cacheTime) < time.Hour {
+			exchangeRateCacheMutex.Unlock()
+			return rate, nil
+		}
+	}
+	exchangeRateCacheMutex.Unlock()
+
+	// Frankfurter API: https://api.frankfurter.app/latest?from=USD&to=INR
+	// Returns: {"amount":1.0,"base":"USD","date":"2026-07-03","rates":{"INR":83.12}}
+	apiURL := fmt.Sprintf("https://api.frankfurter.app/latest?from=%s&to=%s", from, to)
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(apiURL)
+	if err != nil {
+		return 0, fmt.Errorf("exchange rate fetch failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return 0, fmt.Errorf("exchange rate API returned HTTP %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return 0, fmt.Errorf("exchange rate read failed: %w", err)
+	}
+
+	var data struct {
+		Rates map[string]float64 `json:"rates"`
+	}
+	if err := json.Unmarshal(body, &data); err != nil {
+		return 0, fmt.Errorf("exchange rate parse failed: %w", err)
+	}
+
+	rate, ok := data.Rates[to]
+	if !ok {
+		return 0, fmt.Errorf("exchange rate for %s→%s not found in response", from, to)
+	}
+
+	if rate <= 0 {
+		return 0, fmt.Errorf("invalid exchange rate: %f", rate)
+	}
+
+	exchangeRateCacheMutex.Lock()
+	exchangeRateCache[cacheKey] = rate
+	exchangeRateCacheTimes[cacheKey] = time.Now()
+	exchangeRateCacheMutex.Unlock()
+
+	return rate, nil
+}
+
+// extractSiteCurrency searches the initData map (recursively) for a "currency"
+// field. This lets us detect what currency the Razorpay payment link is
+// configured for, so we can convert the user's amount if needed.
+func extractSiteCurrency(initData map[string]interface{}) string {
+	if initData == nil {
+		return ""
+	}
+	return findCurrencyRecursive(initData, 0)
+}
+
+// findCurrencyRecursive searches a map for a "currency" string field, up to
+// a max depth of 5 to avoid infinite recursion on cyclic structures.
+func findCurrencyRecursive(m map[string]interface{}, depth int) string {
+	if depth > 5 {
+		return ""
+	}
+	// Direct key match
+	if cur, ok := m["currency"].(string); ok && cur != "" {
+		return strings.ToUpper(strings.TrimSpace(cur))
+	}
+	// Search nested maps
+	for _, v := range m {
+		if nested, ok := v.(map[string]interface{}); ok {
+			if cur := findCurrencyRecursive(nested, depth+1); cur != "" {
+				return cur
+			}
+		}
+	}
+	return ""
+}
+
 type FetchResponse struct {
 	Body       string
 	StatusCode int
@@ -923,12 +1036,19 @@ type CheckResult struct {
 	Message     string `json:"response"`
 	Proxy       string `json:"proxy"`
 	ProxyStatus string `json:"proxy_status"`
-	// Amount & Currency echo back the user-supplied (or default) charge
-	// parameters so callers can confirm what was actually sent to Razorpay.
-	// `Amount` is in MAJOR units (e.g. 5.00 = ₹5 or $5), matching the input
-	// format. `Currency` is the 3-letter ISO 4217 code (uppercased).
+	// Amount & Currency reflect the ACTUAL amount charged (after currency
+	// conversion if the site's currency differs from what the user requested).
+	// `Amount` is in MAJOR units in the site's currency (e.g. 415.00 = ₹415).
 	Amount   float64 `json:"amount"`
 	Currency string  `json:"currency"`
+	// RequestedAmount & RequestedCurrency echo back what the USER asked for
+	// (before conversion). When no conversion happened, these match Amount/
+	// Currency. When conversion happened, the user can see both values.
+	RequestedAmount   float64 `json:"requested_amount"`
+	RequestedCurrency string  `json:"requested_currency"`
+	// ExchangeRate is the rate used for conversion (1 requested_currency =
+	// X site_currency). 0 when no conversion was needed.
+	ExchangeRate float64 `json:"exchange_rate"`
 }
 
 // zeroDecimalCurrencies lists ISO 4217 currency codes whose smallest unit is
@@ -985,9 +1105,19 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 	if resolvedCurrency == "" {
 		resolvedCurrency = defaultCurrency
 	}
+	// These track the user's ORIGINAL request (before any currency conversion).
+	// They're set once and never changed, so the response always shows what
+	// the user asked for in addition to what was actually charged.
+	requestedAmount := resolvedAmount
+	requestedCurrency := resolvedCurrency
+	exchangeRateUsed := 0.0
+
 	defer func() {
 		result.Amount = resolvedAmount
 		result.Currency = resolvedCurrency
+		result.RequestedAmount = requestedAmount
+		result.RequestedCurrency = requestedCurrency
+		result.ExchangeRate = exchangeRateUsed
 	}()
 
 	yy2 := yy
@@ -1055,25 +1185,18 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 
 	var plink, ppid string
 
-	// ── Custom amount support ────────────────────────────────────────────
+	// ── Custom amount + currency conversion ──────────────────────────────
 	// `amountINR` is the amount in MAJOR units (e.g. 1.0 = ₹1, 5.5 = ₹5.50).
 	// Razorpay's API expects the smallest currency unit (paise for INR,
 	// cents for USD/EUR). We convert here ONCE and reuse `forceAmount`
 	// everywhere downstream so the order, checkout form, cross-border call,
 	// and payment-create form all see the same value.
 	//
-	// IMPORTANT: At this point we don't yet know the order's actual currency
-	// (it comes from the order response later). Razorpay payment links are
-	// currency-locked — the order inherits the link's currency regardless
-	// of what the user requested. So we ALWAYS multiply by 100 (treat as
-	// 2-decimal/INR). This is correct for INR, USD, EUR, GBP, etc.
-	// (which covers 99%+ of Razorpay sites). For 0-decimal currencies
-	// (JPY/KRW) the amount would be 100x too large, but those are extremely
-	// rare on Razorpay.
-	//
-	// The user's `currency` parameter is NOT used here for amount conversion
-	// — it's only echoed back in the response for display. The ACTUAL charge
-	// is always in the order's currency (determined by the merchant's site).
+	// CURRENCY CONVERSION: Razorpay payment links are currency-locked —
+	// the order inherits the link's currency regardless of what the user
+	// requested. If the user selects USD but the site is INR, we convert
+	// the user's amount to the site's currency at the current exchange rate
+	// BEFORE creating the order. E.g. $5 USD → ₹415 INR (at 1 USD = 83 INR).
 	//
 	// Default: ₹1.00 (100 paise) — matches the historical behaviour so
 	// existing callers that don't pass `amount` keep working unchanged.
@@ -1084,7 +1207,37 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 		currency = "INR"
 	}
 	currency = strings.ToUpper(strings.TrimSpace(currency))
-	forceAmount := math.Round(amountINR * 100) // always ×100 (2-decimal assumption)
+
+	// Detect the site's currency from the page data. This lets us convert
+	// the user's amount BEFORE creating the order (so the order is created
+	// with the correct converted amount).
+	siteCurrency := extractSiteCurrency(initData)
+	if siteCurrency != "" && siteCurrency != currency {
+		// User's currency differs from the site's currency → convert
+		rate, convErr := getExchangeRate(currency, siteCurrency)
+		if convErr != nil {
+			log.Printf("[currency-convert] %s→%s failed: %v — falling back to no conversion", currency, siteCurrency, convErr)
+			// Fall back: use the user's amount as-is (will be charged in site currency)
+			// This may result in a smaller charge than expected but won't error
+		} else {
+			convertedAmount := amountINR * rate
+			log.Printf("[currency-convert] %s %.2f → %s %.2f (rate: %.4f)",
+				currency, amountINR, siteCurrency, convertedAmount, rate)
+			// Update resolvedAmount/resolvedCurrency to the converted values
+			// so the response shows the ACTUAL charged amount.
+			resolvedAmount = convertedAmount
+			resolvedCurrency = siteCurrency
+			amountINR = convertedAmount
+			currency = siteCurrency
+			exchangeRateUsed = rate
+		}
+	} else if siteCurrency != "" && siteCurrency == currency {
+		// Same currency — no conversion needed, but update resolvedCurrency
+		// to match the site's currency (defensive).
+		resolvedCurrency = siteCurrency
+	}
+
+	forceAmount := math.Round(amountINR * 100) // ×100 for 2-decimal currencies
 	if forceAmount < 1 {
 		forceAmount = 100 // safety net — never send 0 to Razorpay
 	}
@@ -1181,21 +1334,27 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 	// `orderCurrency` MUST come from the order response, NOT from the
 	// user's input. Razorpay payment links are currency-locked — when you
 	// create an order against a payment link, the order inherits the link's
-	// currency (usually INR). You CANNOT change it. If we send a different
-	// currency in the payment creation step, Razorpay rejects it with:
-	//   "Payment currency provided does not match with the currency in order"
-	//
-	// So the user's `currency` parameter only affects the amount conversion
-	// (paise vs cents) — the ACTUAL charge is always in the order's currency.
+	// currency (usually INR). You CANNOT change it.
 	orderCurrency := strings.ToUpper(strings.TrimSpace(getStringFromMap(orderObj, "currency")))
 	if orderCurrency == "" {
 		orderCurrency = "INR"
 	}
 
-	// Update the response currency to reflect what was ACTUALLY charged.
-	// The defer at the top of checkCard captured `resolvedCurrency` by
-	// reference, so updating it here will be reflected in the response.
-	resolvedCurrency = orderCurrency
+	// If we didn't detect the site currency earlier (siteCurrency was empty)
+	// and thus didn't do conversion, update resolvedCurrency from the order
+	// response now. If we DID do conversion, resolvedCurrency is already
+	// correct (set during the conversion step above).
+	if exchangeRateUsed == 0 {
+		// No conversion happened — use the order's actual currency
+		resolvedCurrency = orderCurrency
+	}
+	// If conversion happened, verify the order's currency matches what we
+	// expected. If not, log a warning (shouldn't happen in practice).
+	if exchangeRateUsed > 0 && orderCurrency != resolvedCurrency {
+		log.Printf("[currency-convert] WARNING: order currency %s != expected %s after conversion",
+			orderCurrency, resolvedCurrency)
+		resolvedCurrency = orderCurrency
+	}
 
 	// Step 3: Get checkout session
 	params3 := url.Values{
@@ -2412,14 +2571,18 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Echo back the amount & currency that were actually attempted so the
-	// caller can confirm what was charged (defaults to 1.00 INR when the
-	// caller didn't specify — see parseAmountParam / parseCurrencyParam).
+	// caller can confirm what was charged. When currency conversion happened,
+	// the response includes both the requested values and the actual charged
+	// values, plus the exchange rate used.
 	resp := map[string]interface{}{
-		"status":   result.Status,
-		"response": result.Message,
-		"proxy":    proxyDisplay,
-		"amount":   result.Amount,
-		"currency": result.Currency,
+		"status":             result.Status,
+		"response":           result.Message,
+		"proxy":              proxyDisplay,
+		"amount":             result.Amount,
+		"currency":           result.Currency,
+		"requested_amount":   result.RequestedAmount,
+		"requested_currency": result.RequestedCurrency,
+		"exchange_rate":      result.ExchangeRate,
 	}
 
 	if result.Status == "error" {

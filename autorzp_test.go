@@ -924,7 +924,7 @@ func TestCheckResultJSONHasAmountAndCurrency(t *testing.T) {
 				Amount:      5.0,
 				Currency:    "INR",
 			},
-			want: `{"status":"declined","response":"Payment declined (payment_risk_check_failed)","proxy":"http://1.2.3.4:8080","proxy_status":"LIVE","amount":5,"currency":"INR"}`,
+			want: `{"status":"declined","response":"Payment declined (payment_risk_check_failed)","proxy":"http://1.2.3.4:8080","proxy_status":"LIVE","amount":5,"currency":"INR","requested_amount":0,"requested_currency":"","exchange_rate":0}`,
 		},
 		{
 			name: "approved with USD amount",
@@ -936,7 +936,7 @@ func TestCheckResultJSONHasAmountAndCurrency(t *testing.T) {
 				Amount:      2.50,
 				Currency:    "USD",
 			},
-			want: `{"status":"approved","response":"Insufficient funds","proxy":"","proxy_status":"LIVE","amount":2.5,"currency":"USD"}`,
+			want: `{"status":"approved","response":"Insufficient funds","proxy":"","proxy_status":"LIVE","amount":2.5,"currency":"USD","requested_amount":0,"requested_currency":"","exchange_rate":0}`,
 		},
 		{
 			name: "charged with default 1 INR",
@@ -948,7 +948,7 @@ func TestCheckResultJSONHasAmountAndCurrency(t *testing.T) {
 				Amount:      1.0,
 				Currency:    "INR",
 			},
-			want: `{"status":"charged","response":"Payment Successful","proxy":"http://1.2.3.4:8080","proxy_status":"LIVE","amount":1,"currency":"INR"}`,
+			want: `{"status":"charged","response":"Payment Successful","proxy":"http://1.2.3.4:8080","proxy_status":"LIVE","amount":1,"currency":"INR","requested_amount":0,"requested_currency":"","exchange_rate":0}`,
 		},
 		{
 			name: "error path still carries amount + currency",
@@ -960,7 +960,7 @@ func TestCheckResultJSONHasAmountAndCurrency(t *testing.T) {
 				Amount:      10.0,
 				Currency:    "EUR",
 			},
-			want: `{"status":"error","response":"WAF Blocked on order creation (HTTP 403)","proxy":"http://1.2.3.4:8080","proxy_status":"BLOCKED","amount":10,"currency":"EUR"}`,
+			want: `{"status":"error","response":"WAF Blocked on order creation (HTTP 403)","proxy":"http://1.2.3.4:8080","proxy_status":"BLOCKED","amount":10,"currency":"EUR","requested_amount":0,"requested_currency":"","exchange_rate":0}`,
 		},
 		{
 			name: "zero-value amount (when caller didn't pass any)",
@@ -970,7 +970,7 @@ func TestCheckResultJSONHasAmountAndCurrency(t *testing.T) {
 				Amount:   1.0,
 				Currency: "INR",
 			},
-			want: `{"status":"error","response":"Key ID not found","proxy":"","proxy_status":"","amount":1,"currency":"INR"}`,
+			want: `{"status":"error","response":"Key ID not found","proxy":"","proxy_status":"","amount":1,"currency":"INR","requested_amount":0,"requested_currency":"","exchange_rate":0}`,
 		},
 	}
 	for _, c := range cases {
