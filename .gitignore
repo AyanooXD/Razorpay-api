@@ -49,3 +49,4 @@ vendor/
 # OS junk
 *.log
 *.tmp
+razorpay-api
