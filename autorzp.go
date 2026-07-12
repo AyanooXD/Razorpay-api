@@ -1740,11 +1740,11 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 		}
 	}
 
-	// Pre-payment delay: 20-30 seconds. Razorpay sometimes needs extra time
+	// Pre-payment delay: 8-15 seconds. Razorpay sometimes needs extra time
 	// to process all confirmations before the payment create step. Without
 	// sufficient delay, the payment may be submitted before Razorpay's
 	// internal state is ready, leading to false declines.
-	time.Sleep(time.Duration(randInt(20000, 30000)) * time.Millisecond)
+	time.Sleep(time.Duration(randInt(8000, 15000)) * time.Millisecond)
 
 	tokenCreate := base64.StdEncoding.EncodeToString([]byte(`[{"name":"sardine","metadata":{"session_id":"` + checkoutID + `"}}]`))
 
