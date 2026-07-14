@@ -37,10 +37,10 @@ import (
 // ────────────────────────────────────────────────────────────────────────
 
 const (
-	// Updated BUILD hashes — fetched from the current checkout.razorpay.com
-	// checkout.js bundle. Old hashes were being flagged by Razorpay's WAF
-	// as outdated, causing all requests to be declined.
-	BUILD    = "57d08abfa73e0a8e69974aa1666acf3c4cfab63a"
+	// Updated BUILD hashes — fetched from checkout.razorpay.com/v1/checkout.js
+	// BUILD = COMMIT_HASH (g var in checkout.js). Updated 2025-07-14 — old hash was WAF-rejected.
+	// BUILD_V1 unchanged (still matches bundle).
+	BUILD    = "309175090e8afce78fc5e908a94a10676ce15aa5"
 	BUILD_V1 = "da4ee3f43a28ad81dba8ed06daf899a4520c691f"
 	PORT     = 7070
 )
@@ -381,7 +381,7 @@ func randInt(min, max int) int {
 // generate a UA, then passes it to NewCustomFetch which derives a MATCHING
 // Sec-CH-UA from the same Chrome major (see parseChromeMajor).
 func genUA() string {
-	major := randInt(120, 147)
+	major := randInt(135, 150)
 	build := randInt(5000, 6999)
 	patch := randInt(50, 249)
 	return fmt.Sprintf("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%d.0.%d.%d Safari/537.36", major, build, patch)
@@ -391,8 +391,17 @@ func genUA() string {
 // Sec-CH-UA string. The main flow uses CustomFetch.secChUA instead, which is
 // derived from the same Chrome major as the User-Agent.
 func genSecChUA() string {
-	major := randInt(120, 147)
-	return fmt.Sprintf(`"Not_A Brand";v="8", "Chromium";v="%d", "Google Chrome";v="%d"`, major, major)
+	major := randInt(135, 150)
+	var gb string
+	switch major % 3 {
+	case 0:
+		gb = "Not_A Brand"
+	case 1:
+		gb = "Not.A/Brand"
+	default:
+		gb = "Not;A Brand"
+	}
+	return fmt.Sprintf(`"%s";v="8", "Chromium";v="%d", "Google Chrome";v="%d"`, gb, major, major)
 }
 
 var _ = genSecChUA // retained for future standalone use
@@ -909,8 +918,26 @@ func getExchangeRate(from, to string) (float64, error) {
 		log.Printf("[exchange-rate] Frankfurter request failed for %s→%s: %v — trying fallback", from, to, err)
 	}
 
-	// ── API 2: ExchangeRate-API (fallback — supports ALL currencies including AED) ──
-	// Returns: {"base":"AED","rates":{"INR":25.97,"USD":0.272,...}}
+	// ── API 2: open.er-api.com/v6 (replaces deprecated exchangerate-api.com/v4) ──
+	// Free, no API key, ~170 currencies. Response: {"result":"success","base_code":"USD","rates":{...}}
+	erV6URL := fmt.Sprintf("https://open.er-api.com/v6/latest/%s", from)
+	if resp, err := client.Get(erV6URL); err == nil {
+		rate, ferr := parseOpenERAPIv6Response(resp, to)
+		resp.Body.Close()
+		if ferr == nil && rate > 0 {
+			exchangeRateCacheMutex.Lock()
+			exchangeRateCache[cacheKey] = rate
+			exchangeRateCacheTimes[cacheKey] = time.Now()
+			exchangeRateCacheMutex.Unlock()
+			log.Printf("[exchange-rate] %s→%s = %.4f (open.er-api.com/v6)", from, to, rate)
+			return rate, nil
+		}
+		log.Printf("[exchange-rate] open.er-api.com/v6 failed for %s→%s: %v — trying legacy v4", from, to, ferr)
+	} else {
+		log.Printf("[exchange-rate] open.er-api.com/v6 request failed for %s→%s: %v — trying legacy v4", from, to, err)
+	}
+
+	// ── API 3: exchangerate-api.com/v4 (legacy fallback — deprecated, still responds) ──
 	erAPIURL := fmt.Sprintf("https://api.exchangerate-api.com/v4/latest/%s", from)
 	if resp, err := client.Get(erAPIURL); err == nil {
 		rate, ferr := parseExchangeRateAPIResponse(resp, to)
@@ -920,14 +947,14 @@ func getExchangeRate(from, to string) (float64, error) {
 			exchangeRateCache[cacheKey] = rate
 			exchangeRateCacheTimes[cacheKey] = time.Now()
 			exchangeRateCacheMutex.Unlock()
-			log.Printf("[exchange-rate] %s→%s = %.4f (ExchangeRate-API fallback)", from, to, rate)
+			log.Printf("[exchange-rate] %s→%s = %.4f (exchangerate-api v4 legacy)", from, to, rate)
 			return rate, nil
 		}
 		// MEDIUM fix #10: record failure in negative cache
 		exchangeRateCacheMutex.Lock()
 		exchangeRateFailCache[cacheKey] = time.Now()
 		exchangeRateCacheMutex.Unlock()
-		return 0, fmt.Errorf("exchange rate fetch failed for %s→%s: Frankfurter + ExchangeRate-API both failed (fallback err: %v)", from, to, ferr)
+		return 0, fmt.Errorf("exchange rate fetch failed for %s→%s: all 3 APIs failed (last err: %v)", from, to, ferr)
 	}
 
 	// MEDIUM fix #10: record failure in negative cache
@@ -981,6 +1008,36 @@ func parseExchangeRateAPIResponse(resp *http.Response, to string) (float64, erro
 	}
 	if err := json.Unmarshal(body, &data); err != nil {
 		return 0, fmt.Errorf("parse failed: %w", err)
+	}
+	rate, ok := data.Rates[to]
+	if !ok {
+		return 0, fmt.Errorf("rate for %s not found", to)
+	}
+	if rate <= 0 {
+		return 0, fmt.Errorf("invalid rate: %f", rate)
+	}
+	return rate, nil
+}
+
+// parseOpenERAPIv6Response parses an open.er-api.com/v6 response.
+// Response format: {"result":"success","base_code":"USD","rates":{"INR":83.12,...}}
+func parseOpenERAPIv6Response(resp *http.Response, to string) (float64, error) {
+	if resp.StatusCode != 200 {
+		return 0, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return 0, fmt.Errorf("read failed: %w", err)
+	}
+	var data struct {
+		Result string             `json:"result"`
+		Rates  map[string]float64 `json:"rates"`
+	}
+	if err := json.Unmarshal(body, &data); err != nil {
+		return 0, fmt.Errorf("parse failed: %w", err)
+	}
+	if data.Result != "success" {
+		return 0, fmt.Errorf("API returned result=%q", data.Result)
 	}
 	rate, ok := data.Rates[to]
 	if !ok {
@@ -1098,13 +1155,24 @@ func NewCustomFetch(proxyParsedURL *url.URL, ua string, proxyRaw string) (*Custo
 		chromeMajor = parseChromeMajor(ua)
 	}
 	if chromeMajor < 0 {
-		chromeMajor = randInt(120, 147)
+		chromeMajor = randInt(135, 150)
 	}
 	if ua == "" {
 		ua = fmt.Sprintf("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%d.0.%d.%d Safari/537.36",
 			chromeMajor, randInt(5000, 6999), randInt(50, 249))
 	}
-	secChUA := fmt.Sprintf(`"Not_A Brand";v="8", "Chromium";v="%d", "Google Chrome";v="%d"`, chromeMajor, chromeMajor)
+	// Sec-CH-UA brand token rotates with Chrome major version (major%3).
+// Static "Not_A Brand" for every version is a WAF fingerprinting signal.
+var garbageBrand string
+switch chromeMajor % 3 {
+case 0:
+    garbageBrand = "Not_A Brand"
+case 1:
+    garbageBrand = "Not.A/Brand"
+default:
+    garbageBrand = "Not;A Brand"
+}
+secChUA := fmt.Sprintf(`"%s";v="8", "Chromium";v="%d", "Google Chrome";v="%d"`, garbageBrand, chromeMajor, chromeMajor)
 
 	return &CustomFetch{client: client, ua: ua, secChUA: secChUA}, nil
 }
