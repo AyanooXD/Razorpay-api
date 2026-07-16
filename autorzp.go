@@ -1400,7 +1400,6 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 		yy2 = yy[2:]
 	}
 	year, _ := strconv.Atoi("20" + yy2)
-	brand := getBrand(cc)
 	ua := genUA()
 	phone := genIndianPhone()
 	phoneShort := phone[3:]
