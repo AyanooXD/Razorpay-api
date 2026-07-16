@@ -5,7 +5,7 @@
 # vs. ~1 GB for a full golang image.
 
 # ---------- stage 1: build ----------
-FROM golang:1.22-alpine AS builder
+FROM golang:1.24-alpine AS builder
 
 # git is needed by go modules if any dependency is fetched via VCS.
 RUN apk add --no-cache git ca-certificates
@@ -13,7 +13,7 @@ RUN apk add --no-cache git ca-certificates
 WORKDIR /src
 
 # Cache module downloads: copy only go.mod first, download, then copy source.
-COPY go.mod ./
+COPY go.mod go.sum ./
 RUN go mod download
 
 COPY autorzp.go ./
