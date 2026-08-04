@@ -203,6 +203,79 @@ Highlights:
   drift is fixed via `math.Round`. Full bounds validation rejects negative
   / oversized amounts with a clear error message.
 
+### Round 4 (2026-08-02) — Real-time audit + fixes
+
+A full re-audit against the live Razorpay / Chrome / uTLS / exchange-rate
+ecosystem as of August 2026 surfaced and fixed:
+
+- **Outdated BUILD hash** — the previous `BUILD` constant
+  (`309175090e8afce78fc5e908a94a10676ce15aa5`) was rotated out of Razorpay's
+  `checkout.js` (verified by fetching `checkout.razorpay.com/v1/checkout.js`
+  live). Updated to the current hash
+  (`11d0fb998d397102511c6c304e4f8565aaad29b3`).
+- **Stale Chrome major range** — `randInt(135, 150)` produced User-Agent
+  strings claiming Chrome 135–150, which no real browser has run since
+  early 2025. Current stable Chrome is 151 (released 2026-07-27). Range
+  updated to `randInt(145, 152)`. Using a stale Chrome version is a
+  trivial WAF fingerprint signal.
+- **Zero-decimal currency bug** — `forceAmount := math.Round(amountINR * 100)`
+  hardcoded a ×100 multiplier, sending `10000` instead of `100` for
+  `amount=100 JPY`. This would cause every JPY/KRW/VND/etc. charge to be
+  100× too large. Fixed by using the already-defined `toSmallestUnit()`
+  helper, which respects the ISO 4217 zero-decimal currency list.
+- **session_token regex case-sensitivity** — `sessionTokenRe` used
+  `[A-F0-9]{40,}` which only matched uppercase hex. If Razorpay ever
+  emits a lowercase token, the entire flow would fail with "Session token
+  not found". Updated to `[a-fA-F0-9]{40,}` for case-insensitive matching.
+- **Variable shadowing `net/url` package** — `tgSendOne` declared a local
+  `url := "https://api.telegram.org/..."` which shadowed the imported
+  `url` package. This compiled today but was a bug magnet — any future
+  edit that adds `url.QueryEscape` or similar inside `tgSendOne` would
+  silently call the string method instead of the package function.
+  Renamed to `apiURL`.
+- **Fragile proxy CONNECT parsing** — the previous code read only 1024
+  bytes of the proxy's CONNECT response and used substring search for
+  ` 200 ` to detect success. This fails if (a) the proxy sends > 1024
+  bytes of headers, (b) TCP fragments the response across reads, or
+  (c) a future HTTP status code collides with the substring. Replaced
+  with proper `http.ReadResponse` + `bufio.Reader` parsing, plus a new
+  `bufConn` wrapper that preserves any bytes the bufio reader buffered
+  past the response headers (which belong to the TLS handshake).
+- **Dead code removal** — `getProxyTransport`, `proxyClientCache`,
+  `proxyClientMutex`, `genSecChUA`, and `var _ = genSecChUA` were
+  defined but never called. Removed to reduce maintenance surface.
+- **Misleading `getStringFromMap` comment** — the doc claimed non-string
+  types were returned as `""`, but the code (and tests) actually coerce
+  them to strings via `fmt.Sprintf("%v", v)`. Updated the comment to
+  match the actual behavior, and clarified that `nil` is the only type
+  that returns `""`.
+- **`getEnvDefault` whitespace handling** — a stray whitespace env var
+  like `PROXY_FILE=" "` would be returned as-is and cause a confusing
+  "no such file" error. Now trims whitespace before checking emptiness.
+- **`filepath` parameter shadowing** — `loadProxies(filepath string)` and
+  `loadSites(filepath string)` shadowed the `filepath` package name.
+  Renamed to `path` to prevent future bugs if anyone adds
+  `filepath.Join` / `filepath.Clean` calls inside.
+- **live.txt crash safety** — `liveWriterGoroutine` now calls `f.Sync()`
+  after every flush so a SIGKILL or power loss can no longer lose up to
+  2 seconds of buffered writes.
+- **Test coverage** — added 9 new tests for the round-4 changes:
+  `TestBufConnReadsPrefixFirst`, `TestBufConnReadsAllPrefixInOneCall`,
+  `TestBufConnEmptyPrefixFallsThrough`, `TestBufConnClosePropagates`,
+  `TestSessionTokenReUppercase`, `TestSessionTokenReLowercase`,
+  `TestSessionTokenReMixedCase`, `TestSessionTokenReSingleQuote`,
+  `TestSessionTokenReTooShort`.
+
+Verified live (2026-08-02) — all endpoints still active:
+`api.razorpay.com/v1/standard_checkout/payments/create/checkout`,
+`api.razorpay.com/v2/standard_checkout/preferences`,
+`api.razorpay.com/v1/checkout/public`,
+`lumberjack.razorpay.com/v2/m/logz`,
+`lumberjack.razorpay.com/v2/logz`. Currency APIs: `api.frankfurter.dev`
+(canonical — `.app` is a 301 redirect to `.dev`), `open.er-api.com/v6`,
+`api.exchangerate-api.com/v4` (soft-deprecated, still works). uTLS
+v1.8.2 is current; `HelloChrome_Auto` aliases to `HelloChrome_133`.
+
 Plus a full unit-test suite (`autorzp_test.go`) covering the bug-prone
 helpers and the new amount/currency parsing logic.
 

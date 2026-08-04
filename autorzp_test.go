@@ -18,6 +18,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -1335,4 +1336,174 @@ func truncateBodyForLog(s string, max int) string {
 		return s
 	}
 	return s[:max] + "..."
+}
+
+// ─── bufConn ───────────────────────────────────────────────────────────────
+// bufConn is used by NewCustomFetch's DialTLS to wrap a net.Conn so bytes
+// that bufio.Reader already pulled off the wire (while parsing the proxy's
+// CONNECT response) are returned to the next Read() caller before the
+// underlying connection is read. Losing those bytes would corrupt the TLS
+// handshake.
+
+func TestBufConnReadsPrefixFirst(t *testing.T) {
+	// Set up a pipe so we have a real net.Conn to wrap.
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+
+	wrapped := &bufConn{
+		prefix: []byte("PREFIX-"),
+		Conn:   c1,
+	}
+
+	// Write PREFIX- into the buffer, then write "TAIL" into the pipe.
+	// We need to write to c2 in a goroutine because pipe writes block
+	// until the other side reads.
+	go func() {
+		c2.Write([]byte("TAIL"))
+	}()
+
+	// First read should return the prefix.
+	buf := make([]byte, 16)
+	n, err := wrapped.Read(buf)
+	if err != nil {
+		t.Fatalf("first read error: %v", err)
+	}
+	if string(buf[:n]) != "PREFIX-" {
+		t.Errorf("first read = %q, want %q", buf[:n], "PREFIX-")
+	}
+
+	// Second read should return the pipe data.
+	n, err = wrapped.Read(buf)
+	if err != nil {
+		t.Fatalf("second read error: %v", err)
+	}
+	if string(buf[:n]) != "TAIL" {
+		t.Errorf("second read = %q, want %q", buf[:n], "TAIL")
+	}
+}
+
+func TestBufConnReadsAllPrefixInOneCall(t *testing.T) {
+	// If the caller's buffer is large enough, the prefix should be returned
+	// in a single Read() call (since prefix is fully buffered).
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+
+	wrapped := &bufConn{
+		prefix: []byte("HELLO"),
+		Conn:   c1,
+	}
+
+	buf := make([]byte, 64)
+	n, err := wrapped.Read(buf)
+	if err != nil {
+		t.Fatalf("read error: %v", err)
+	}
+	if n != 5 {
+		t.Errorf("read %d bytes, want 5", n)
+	}
+	if string(buf[:n]) != "HELLO" {
+		t.Errorf("read = %q, want HELLO", buf[:n])
+	}
+}
+
+func TestBufConnEmptyPrefixFallsThrough(t *testing.T) {
+	// Empty prefix + nil offset → first read goes straight to the
+	// underlying connection.
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+
+	wrapped := &bufConn{
+		prefix: nil,
+		Conn:   c1,
+	}
+
+	go func() { c2.Write([]byte("DATA")) }()
+
+	buf := make([]byte, 16)
+	n, err := wrapped.Read(buf)
+	if err != nil {
+		t.Fatalf("read error: %v", err)
+	}
+	if string(buf[:n]) != "DATA" {
+		t.Errorf("read = %q, want DATA", buf[:n])
+	}
+}
+
+func TestBufConnClosePropagates(t *testing.T) {
+	// Closing the wrapped conn should close the underlying conn.
+	c1, c2 := net.Pipe()
+	defer c2.Close()
+
+	wrapped := &bufConn{
+		prefix: nil,
+		Conn:   c1,
+	}
+	if err := wrapped.Close(); err != nil {
+		t.Fatalf("Close error: %v", err)
+	}
+
+	// Subsequent read on c2 should fail with EOF or closed-conn error.
+	buf := make([]byte, 16)
+	_, err := c2.Read(buf)
+	if err == nil {
+		t.Errorf("expected error reading from closed pipe, got nil")
+	}
+}
+
+// ─── sessionTokenRe ────────────────────────────────────────────────────────
+// The regex must match Razorpay's session_token in the checkout/public HTML
+// response. Razorpay uses uppercase hex today, but the regex should also
+// accept lowercase hex in case Razorpay ever changes.
+
+func TestSessionTokenReUppercase(t *testing.T) {
+	html := `window.session_token="ABCDEF0123456789ABCDEF0123456789ABCDEF01";`
+	m := sessionTokenRe.FindStringSubmatch(html)
+	if len(m) < 2 {
+		t.Fatalf("no match for uppercase session_token")
+	}
+	if m[1] != "ABCDEF0123456789ABCDEF0123456789ABCDEF01" {
+		t.Errorf("matched %q, want uppercase token", m[1])
+	}
+}
+
+func TestSessionTokenReLowercase(t *testing.T) {
+	// Lowercase hex — should match because we use [a-fA-F0-9].
+	html := `window.session_token="abcdef0123456789abcdef0123456789abcdef01";`
+	m := sessionTokenRe.FindStringSubmatch(html)
+	if len(m) < 2 {
+		t.Fatalf("no match for lowercase session_token — regex is too strict")
+	}
+	if m[1] != "abcdef0123456789abcdef0123456789abcdef01" {
+		t.Errorf("matched %q, want lowercase token", m[1])
+	}
+}
+
+func TestSessionTokenReMixedCase(t *testing.T) {
+	html := `window.session_token="AbCdEf0123456789AbCdEf0123456789AbCdEf01";`
+	m := sessionTokenRe.FindStringSubmatch(html)
+	if len(m) < 2 {
+		t.Fatalf("no match for mixed-case session_token")
+	}
+}
+
+func TestSessionTokenReSingleQuote(t *testing.T) {
+	// Razorpay sometimes uses single quotes in older build variants.
+	html := `window.session_token='ABCDEF0123456789ABCDEF0123456789ABCDEF01';`
+	m := sessionTokenRe.FindStringSubmatch(html)
+	if len(m) < 2 {
+		t.Fatalf("no match for single-quoted session_token")
+	}
+}
+
+func TestSessionTokenReTooShort(t *testing.T) {
+	// A 39-char hex string should NOT match (we require 40+).
+	html := `window.session_token="ABCDEF0123456789ABCDEF0123456789ABCDEF";`
+	m := sessionTokenRe.FindStringSubmatch(html)
+	if len(m) >= 2 {
+		t.Errorf("matched too-short token %q (len=%d), should not match",
+			m[1], len(m[1]))
+	}
 }
