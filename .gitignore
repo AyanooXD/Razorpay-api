@@ -49,3 +49,6 @@ vendor/
 # OS junk
 *.log
 *.tmp
+autorzp_bin
+rzp_checker
+rzp_checker_v*
