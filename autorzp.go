@@ -881,7 +881,8 @@ func (f *CustomFetch) PostForm(targetURL string, headers map[string]string, form
 // Supports: pages.razorpay.com/<slug>  and  razorpay.me/@slug
 // Returns: (initData, proxyStatus_or_resolvedURL, error)
 func resolveRazorpayInitData(fetch *CustomFetch, targetURL string, proxyRaw string) (map[string]interface{}, string, error) {
-	isRzpMe := strings.Contains(targetURL, "razorpay.me/")
+	// pl_* under razorpay.me is handled by the isPLID block below
+	isRzpMe := strings.Contains(targetURL, "razorpay.me/") && !strings.Contains(targetURL, "/pl_")
 
 	if isRzpMe {
 		// razorpay.me flow: follow redirect → try API
@@ -926,6 +927,46 @@ func resolveRazorpayInitData(fetch *CustomFetch, targetURL string, proxyRaw stri
 			return data, "", nil
 		}
 		return nil, "LIVE", fmt.Errorf("Could not extract data from razorpay.me page (slug: %s)", slug)
+	}
+
+	// ── pl_* payment link IDs: pages.razorpay.com/pl_* always returns a 1488-byte
+	// "Error: URL not found" page because pl_* IDs are not valid page slugs.
+	// The correct URL is razorpay.com/payment-link/{pl_id} which serves var data.
+	isPLID := (strings.Contains(targetURL, "pages.razorpay.com/pl_") ||
+		strings.Contains(targetURL, "razorpay.me/pl_"))
+	if isPLID {
+		plID := ""
+		parts := strings.Split(strings.TrimRight(targetURL, "/"), "/")
+		for _, part := range parts {
+			if strings.HasPrefix(part, "pl_") {
+				plID = part
+				break
+			}
+		}
+		if plID == "" {
+			return nil, "LIVE", fmt.Errorf("could not extract pl_* ID from URL: %s", targetURL)
+		}
+		correctURL := "https://razorpay.com/payment-link/" + plID
+		log.Printf("[pl_*] redirecting %s → %s", targetURL, correctURL)
+		respPL, errPL := fetch.Get(correctURL, map[string]string{
+			"Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+			"Sec-Fetch-Dest":            "document",
+			"Sec-Fetch-Mode":            "navigate",
+			"Sec-Fetch-Site":            "none",
+			"Sec-Fetch-User":            "?1",
+			"Upgrade-Insecure-Requests": "1",
+		})
+		if errPL != nil {
+			return nil, classifyProxyError(errPL), fmt.Errorf("pl_* page fetch: %w", errPL)
+		}
+		if respPL.StatusCode == 403 || respPL.StatusCode == 429 {
+			return nil, "BLOCKED", fmt.Errorf("WAF blocked pl_* fetch (HTTP %d)", respPL.StatusCode)
+		}
+		textPL := respPL.Text()
+		if dataPL := tryExtractFromHTML(textPL); dataPL != nil {
+			return dataPL, "", nil
+		}
+		return nil, "LIVE", fmt.Errorf("var data not found in pl_* HTML (page len=%d)", len(textPL))
 	}
 
 	// Standard pages.razorpay.com flow
