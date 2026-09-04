@@ -10,8 +10,8 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 
-# Copy ONLY main.go (latest version with all fixes)
-COPY main.go ./
+# Copy ONLY autorzp.go (latest version with all fixes)
+COPY autorzp.go ./
 
 RUN go build -trimpath -ldflags="-s -w" -o /out/autorzp ./...
 
