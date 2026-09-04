@@ -199,12 +199,18 @@ var (
 	shutdownCh   = make(chan struct{})
 
 	liveLogMutex sync.Mutex
-	liveFilePath = "/data/live.txt"
+	liveFilePath  = "/data/live.txt"
+	sitesFilePath string // set in main(), used by markSiteDead
+	proxyFilePath string // set in main(), used by removeDeadProxyFromFile
 
 	deadProxyMutex   sync.Mutex
 	deadProxies      = make(map[string]time.Time)
 	deadProxyTTL     = 3 * time.Minute
 	deadProxySweepAt time.Time
+
+	// Dead site tracking — permanently remove confirmed dead sites from file
+	deadSiteMutex sync.Mutex
+	deadSiteSet   = make(map[string]struct{})
 
 	sharedHTTPClient = &http.Client{
 		Timeout: 15 * time.Second,
@@ -413,6 +419,8 @@ func markProxyDead(proxyRaw string) {
 	if proxyRaw == "" {
 		return
 	}
+	// Permanently remove from file and in-memory list
+	go removeDeadProxyFromFile(proxyRaw, proxyFilePath)
 	deadProxyMutex.Lock()
 	deadProxies[proxyRaw] = time.Now().Add(deadProxyTTL)
 	if time.Since(deadProxySweepAt) > 5*time.Minute {
@@ -475,6 +483,108 @@ func loadSites(path string) []string {
 		}
 	}
 	return sites
+}
+
+// markSiteDead permanently removes a site URL from the sites file and
+// the in-memory razorpayURLs slice. Safe for concurrent use.
+func markSiteDead(siteURL string, sitesFilePath string) {
+	if siteURL == "" {
+		return
+	}
+	deadSiteMutex.Lock()
+	if _, already := deadSiteSet[siteURL]; already {
+		deadSiteMutex.Unlock()
+		return
+	}
+	deadSiteSet[siteURL] = struct{}{}
+	deadSiteMutex.Unlock()
+
+	log.Printf("[dead-site] removing %s from file", siteURL)
+
+	// Remove from in-memory slice
+	urlMu.Lock()
+	newURLs := razorpayURLs[:0]
+	for _, u := range razorpayURLs {
+		if u != siteURL {
+			newURLs = append(newURLs, u)
+		}
+	}
+	razorpayURLs = newURLs
+	urlMu.Unlock()
+
+	// Remove from file
+	if sitesFilePath == "" {
+		return
+	}
+	fileDataBytes, err := os.ReadFile(sitesFilePath)
+	if err != nil {
+		log.Printf("[dead-site] read file err: %v", err)
+		return
+	}
+	lines := strings.Split(string(fileDataBytes), "\n")
+	var kept []string
+	for _, line := range lines {
+		if strings.TrimSpace(line) != siteURL {
+			kept = append(kept, line)
+		}
+	}
+	// Trim trailing blank lines but preserve one newline at end
+	for len(kept) > 0 && strings.TrimSpace(kept[len(kept)-1]) == "" {
+		kept = kept[:len(kept)-1]
+	}
+	newContent := strings.Join(kept, "\n")
+	if len(kept) > 0 {
+		newContent += "\n"
+	}
+	if writeErr := os.WriteFile(sitesFilePath, []byte(newContent), 0644); writeErr != nil {
+		log.Printf("[dead-site] write file err: %v", writeErr)
+	} else {
+		log.Printf("[dead-site] removed %s → %d sites remaining", siteURL, len(razorpayURLs))
+	}
+}
+
+// removeDeadProxyFromFile permanently removes a proxy from the proxy file.
+// markProxyDead() already bans it in-memory; this persists the removal.
+func removeDeadProxyFromFile(proxyRaw string, proxyFilePath string) {
+	if proxyRaw == "" || proxyFilePath == "" {
+		return
+	}
+	fileDataBytes, err := os.ReadFile(proxyFilePath)
+	if err != nil {
+		return
+	}
+	lines := strings.Split(string(fileDataBytes), "\n")
+	var kept []string
+	for _, line := range lines {
+		// Match by raw proxy string or by formatted variant
+		formatted := formatProxy(strings.TrimSpace(line))
+		if strings.TrimSpace(line) != proxyRaw && formatted != proxyRaw {
+			kept = append(kept, line)
+		}
+	}
+	for len(kept) > 0 && strings.TrimSpace(kept[len(kept)-1]) == "" {
+		kept = kept[:len(kept)-1]
+	}
+	newContent := strings.Join(kept, "\n")
+	if len(kept) > 0 {
+		newContent += "\n"
+	}
+	// Also remove from in-memory globalProxyList
+	proxyMu.Lock()
+	newList := globalProxyList[:0]
+	for _, p := range globalProxyList {
+		if p.raw != proxyRaw {
+			newList = append(newList, p)
+		}
+	}
+	globalProxyList = newList
+	proxyMu.Unlock()
+
+	if writeErr := os.WriteFile(proxyFilePath, []byte(newContent), 0644); writeErr != nil {
+		log.Printf("[dead-proxy] write file err: %v", writeErr)
+	} else {
+		log.Printf("[dead-proxy] removed %s → %d proxies remaining", proxyRaw, len(globalProxyList))
+	}
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1060,6 +1170,7 @@ func resolveRazorpayInitData(fetch *CustomFetch, targetURL string, proxyRaw stri
 		return nil, "BLOCKED", fmt.Errorf("WAF blocked page fetch (HTTP %d)", resp.StatusCode)
 	}
 	if resp.StatusCode == 404 {
+		go markSiteDead(targetURL, sitesFilePath)
 		return nil, "LIVE", fmt.Errorf("Payment page not found (404)")
 	}
 	if resp.StatusCode >= 400 {
@@ -1069,6 +1180,10 @@ func resolveRazorpayInitData(fetch *CustomFetch, targetURL string, proxyRaw stri
 	text := resp.Text()
 	if data := tryExtractFromHTML(text); data != nil {
 		return data, "", nil
+	}
+	// 1488 = Razorpay's static "Error: URL not found" error page
+	if len(text) <= 1600 {
+		go markSiteDead(targetURL, sitesFilePath)
 	}
 	return nil, "LIVE", fmt.Errorf("var data not found in page HTML (page len=%d)", len(text))
 }
@@ -1798,9 +1913,15 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 		return CheckResult{Status: "declined", Message: "Page: " + errMsg, Proxy: proxyRaw, ProxyStatus: "LIVE"}
 	}
 	if errObj, ok := initData["error"].(map[string]interface{}); ok {
+		errCode := getStringFromMap(errObj, "code")
 		errMsg := getStringFromMap(errObj, "description")
 		if errMsg == "" { errMsg = getStringFromMap(errObj, "reason") }
 		if errMsg == "" { errMsg = "Page fetch error" }
+		// Permanently dead signals: invalid link ID or explicitly deactivated
+		if errCode == "invalid_id" || errCode == "page_deactivated" ||
+			strings.Contains(errMsg, "deactivated") || strings.Contains(errMsg, "invalid") {
+			go markSiteDead(targetURL, sitesFilePath)
+		}
 		return CheckResult{Status: "declined", Message: "Page: " + errMsg, Proxy: proxyRaw, ProxyStatus: "LIVE"}
 	}
 
@@ -2515,8 +2636,10 @@ func main() {
 
 	os.MkdirAll("/data", 0755) // ensure persistent volume dir exists
 	liveFilePath = getEnvDefault("LIVE_FILE", "/data/live.txt")
-	proxyFile := getEnvDefault("PROXY_FILE", "/data/px.txt")
-	sitesFile := getEnvDefault("SITES_FILE", "/data/sites.txt")
+	proxyFilePath = getEnvDefault("PROXY_FILE", "/data/px.txt")
+	sitesFilePath = getEnvDefault("SITES_FILE", "/data/sites.txt")
+	proxyFile := proxyFilePath
+	sitesFile := sitesFilePath
 
 	globalProxyList = loadProxies(proxyFile)
 	razorpayURLs = loadSites(sitesFile)
@@ -2609,6 +2732,18 @@ func main() {
 		defer func() { <-checkSemaphore }()
 
 		result := checkCard(cc, mm, yy, cvv, pp, targetURL, amount, currency, billingLine1, billingCity, billingState, billingPostal)
+
+		// Auto-remove dead sites from file based on result message
+		if targetURL != "" {
+			msg := strings.ToLower(result.Message)
+			if strings.Contains(msg, "deactivated") ||
+				strings.Contains(msg, "this link is invalid") ||
+				strings.Contains(msg, "page not found") ||
+				strings.Contains(msg, "invalid_id") {
+				go markSiteDead(targetURL, sitesFilePath)
+			}
+		}
+
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(result)
 	})
