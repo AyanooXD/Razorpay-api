@@ -1113,25 +1113,37 @@ func resolveRazorpayInitData(fetch *CustomFetch, targetURL string, proxyRaw stri
 		return nil, "LIVE", fmt.Errorf("Could not extract data from razorpay.me page (slug: %s)", slug)
 	}
 
-	// ── pl_* payment link IDs: pages.razorpay.com/pl_* always returns a 1488-byte
-	// "Error: URL not found" page because pl_* IDs are not valid page slugs.
-	// The correct URL is razorpay.com/payment-link/{pl_id} which serves var data.
+	// ── pl_* payment link IDs ─────────────────────────────────────────────────
+	//
+	// pages.razorpay.com/pl_* → always returns 1488-byte static error HTML.
+	// The canonical URL is razorpay.com/payment-link/pl_* which serves var data.
+	//
+	// Active link:  var data = {"key_id":"rzp_live_...", "payment_link":{...}}
+	// Expired link: var data = {"error":{"code":"invalid_id","description":"..."}}
+	//
+	// If var data is not found (some links use SPA/React), fall back to
+	// api.razorpay.com/v1/checkout/public?payment_link_id=pl_*
 	isPLID := (strings.Contains(targetURL, "pages.razorpay.com/pl_") ||
-		strings.Contains(targetURL, "razorpay.me/pl_"))
+		strings.Contains(targetURL, "razorpay.me/pl_") ||
+		strings.Contains(targetURL, "razorpay.com/payment-link/pl_"))
 	if isPLID {
 		plID := ""
-		parts := strings.Split(strings.TrimRight(targetURL, "/"), "/")
-		for _, part := range parts {
-			if strings.HasPrefix(part, "pl_") {
-				plID = part
-				break
+		parsedPL, _ := url.Parse(targetURL)
+		if parsedPL != nil {
+			for _, seg := range strings.Split(strings.Trim(parsedPL.Path, "/"), "/") {
+				if strings.HasPrefix(seg, "pl_") {
+					plID = seg
+					break
+				}
 			}
 		}
 		if plID == "" {
 			return nil, "LIVE", fmt.Errorf("could not extract pl_* ID from URL: %s", targetURL)
 		}
+
 		correctURL := "https://razorpay.com/payment-link/" + plID
-		log.Printf("[pl_*] redirecting %s → %s", targetURL, correctURL)
+		log.Printf("[pl_*] %s → %s", targetURL, correctURL)
+
 		respPL, errPL := fetch.Get(correctURL, map[string]string{
 			"Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 			"Sec-Fetch-Dest":            "document",
@@ -1146,14 +1158,60 @@ func resolveRazorpayInitData(fetch *CustomFetch, targetURL string, proxyRaw stri
 		if respPL.StatusCode == 403 || respPL.StatusCode == 429 {
 			return nil, "BLOCKED", fmt.Errorf("WAF blocked pl_* fetch (HTTP %d)", respPL.StatusCode)
 		}
+
 		textPL := respPL.Text()
-		if dataPL := tryExtractFromHTML(textPL); dataPL != nil {
-			return dataPL, "", nil
+
+		// tryExtractFromHTMLWithError: also returns pure-error objects so we
+		// can surface the exact "invalid_id" / "page_deactivated" message.
+		if rawData := tryExtractFromHTMLWithError(textPL); rawData != nil {
+			// Check if it's an error object (expired / deactivated link)
+			if errObj, isErrResp := rawData["error"].(map[string]interface{}); isErrResp {
+				errCode := getStringFromMap(errObj, "code")
+				errDesc := getStringFromMap(errObj, "description")
+				if errDesc == "" {
+					errDesc = errCode
+				}
+				// Permanently dead — remove from sites file
+				go markSiteDead(targetURL, sitesFilePath)
+				return nil, "LIVE", fmt.Errorf("Payment link %s: %s", errCode, errDesc)
+			}
+			// Valid checkout data
+			return rawData, "", nil
 		}
+
+		// No var data in HTML — try checkout/public API (React SPA path)
+		checkoutAPIURL := fmt.Sprintf(
+			"https://api.razorpay.com/v1/checkout/public?payment_link_id=%s&traffic_env=production&new_session=1",
+			plID,
+		)
+		apiResp, apiErr := fetch.Get(checkoutAPIURL, map[string]string{
+			"Accept":  "application/json",
+			"Origin":  "https://razorpay.com",
+			"Referer": correctURL,
+		})
+		if apiErr == nil && apiResp.StatusCode == 200 {
+			var apiData map[string]interface{}
+			if json.Unmarshal(apiResp.Body, &apiData) == nil && len(apiData) > 0 {
+				// Check if API returned an error
+				if errObj, isErrResp := apiData["error"].(map[string]interface{}); isErrResp {
+					errCode := getStringFromMap(errObj, "code")
+					go markSiteDead(targetURL, sitesFilePath)
+					return nil, "LIVE", fmt.Errorf("checkout API: %s", errCode)
+				}
+				log.Printf("[pl_*] got data from checkout/public API for %s", plID)
+				return apiData, "", nil
+			}
+		}
+
+		// Both methods failed — could be a WAF/proxy issue, don't mark as dead
 		return nil, "LIVE", fmt.Errorf("var data not found in pl_* HTML (page len=%d)", len(textPL))
 	}
 
-	// Standard pages.razorpay.com flow
+	// ── Standard pages.razorpay.com/<slug> flow ─────────────────────────────
+	//
+	// Valid active pages serve: var data = {"key_id":"rzp_live_...", ...}
+	// Invalid/expired pages return the 1488-byte static error HTML.
+	// Some newer pages are React SPAs — no var data in HTML, need checkout API.
 	resp, err := fetch.Get(targetURL, map[string]string{
 		"Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 		"Sec-Fetch-Dest":            "document",
@@ -1178,17 +1236,85 @@ func resolveRazorpayInitData(fetch *CustomFetch, targetURL string, proxyRaw stri
 	}
 
 	text := resp.Text()
-	if data := tryExtractFromHTML(text); data != nil {
-		return data, "", nil
+
+	// Use WithError variant to also detect pure-error var data objects
+	if rawData := tryExtractFromHTMLWithError(text); rawData != nil {
+		if errObj, isErrResp := rawData["error"].(map[string]interface{}); isErrResp {
+			errCode := getStringFromMap(errObj, "code")
+			errDesc := getStringFromMap(errObj, "description")
+			if errDesc == "" { errDesc = errCode }
+			go markSiteDead(targetURL, sitesFilePath)
+			return nil, "LIVE", fmt.Errorf("Payment page %s: %s", errCode, errDesc)
+		}
+		return rawData, "", nil
 	}
-	// 1488 = Razorpay's static "Error: URL not found" error page
+
+	// Static 1488-byte error page = "URL not found" → dead site
 	if len(text) <= 1600 {
 		go markSiteDead(targetURL, sitesFilePath)
+		return nil, "LIVE", fmt.Errorf("Payment page not found (invalid slug, page len=%d)", len(text))
 	}
+
+	// Larger page with no var data — might be React SPA
+	// Try checkout/public API as fallback
+	parsedFB, _ := url.Parse(targetURL)
+	var slugFB string
+	if parsedFB != nil {
+		segs := strings.Split(strings.Trim(parsedFB.Path, "/"), "/")
+		if len(segs) > 0 {
+			slugFB = segs[len(segs)-1]
+		}
+	}
+	if slugFB != "" {
+		fbAPIURL := fmt.Sprintf(
+			"https://api.razorpay.com/v1/checkout/public?payment_page_id=%s&traffic_env=production&new_session=1",
+			slugFB,
+		)
+		fbResp, fbErr := fetch.Get(fbAPIURL, map[string]string{
+			"Accept":  "application/json",
+			"Origin":  "https://pages.razorpay.com",
+			"Referer": targetURL,
+		})
+		if fbErr == nil && fbResp.StatusCode == 200 {
+			var fbData map[string]interface{}
+			if json.Unmarshal(fbResp.Body, &fbData) == nil && len(fbData) > 0 {
+				if _, isErr := fbData["error"].(map[string]interface{}); !isErr {
+					log.Printf("[pages] SPA fallback checkout/public succeeded for %s", slugFB)
+					return fbData, "", nil
+				}
+			}
+		}
+	}
+
 	return nil, "LIVE", fmt.Errorf("var data not found in page HTML (page len=%d)", len(text))
 }
 
 func tryExtractFromHTML(html string) map[string]interface{} {
+	patterns := []string{"data", "__INITIAL_DATA__", "__rzp_config__", "rzpConfig", "pageConfig",
+		"checkoutData", "initialData", "__INITIAL_STATE__", "window.__data__", "rzpData"}
+	for _, name := range patterns {
+		raw := extractJSONVar(html, name)
+		if raw == "" {
+			continue
+		}
+		var result map[string]interface{}
+		if err := json.Unmarshal([]byte(raw), &result); err == nil && len(result) > 0 {
+			// Skip pure error responses — e.g. {"error":{"code":"invalid_id"}}
+			// These are NOT checkout data and should not be returned as valid initData.
+			// We return nil so the caller can try other resolution methods.
+			if errObj, hasErr := result["error"].(map[string]interface{}); hasErr && len(result) == 1 {
+				_ = errObj
+				return nil
+			}
+			return result
+		}
+	}
+	return nil
+}
+
+// tryExtractFromHTMLWithError is like tryExtractFromHTML but also
+// returns pure-error objects so the caller can surface the error message.
+func tryExtractFromHTMLWithError(html string) map[string]interface{} {
 	patterns := []string{"data", "__INITIAL_DATA__", "__rzp_config__", "rzpConfig", "pageConfig",
 		"checkoutData", "initialData", "__INITIAL_STATE__", "window.__data__", "rzpData"}
 	for _, name := range patterns {
