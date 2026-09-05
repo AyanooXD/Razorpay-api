@@ -1061,159 +1061,116 @@ func (f *CustomFetch) PostForm(targetURL string, headers map[string]string, form
 //  RAZORPAY PAGE DATA RESOLVER
 // ─────────────────────────────────────────────────────────────────────
 
-// resolveRazorpayInitData fetches the payment page and extracts the `var data = {...}` JSON.
-// Supports: pages.razorpay.com/<slug>  and  razorpay.me/@slug
-// Returns: (initData, proxyStatus_or_resolvedURL, error)
+// resolveRazorpayInitData fetches the Razorpay payment page and extracts var data.
+//
+// Supported URL types:
+//   pages.razorpay.com/pl_XXXXX          → appends /view, extracts var data
+//   pages.razorpay.com/pl_XXXXX/view     → direct fetch
+//   pages.razorpay.com/SLUG              → direct fetch (payment pages)
+//   razorpay.me/@handle                  → direct fetch
+//   razorpay.com/payment-link/pl_XXXXX   → rewritten to pages.../pl_.../view
+//   rzp.io/l/XXXX, rzp.io/rzp/XXXX      → follow redirect to canonical URL
+//   rzp.io/i/XXXX (invoice)              → follow redirect to canonical URL
+//
+// Returns: (initData map, proxyStatus string, error)
 func resolveRazorpayInitData(fetch *CustomFetch, targetURL string, proxyRaw string) (map[string]interface{}, string, error) {
-	// pl_* under razorpay.me is handled by the isPLID block below
-	isRzpMe := strings.Contains(targetURL, "razorpay.me/") && !strings.Contains(targetURL, "/pl_")
 
-	if isRzpMe {
-		// razorpay.me flow: follow redirect → try API
-		resp, err := fetch.Get(targetURL, map[string]string{
+	// ── Step 1: Normalise the URL ────────────────────────────────────────────
+	//
+	// rzp.io short links (l/, rzp/, i/) must be followed to the canonical URL.
+	// razorpay.com/payment-link/pl_* is canonically pages.razorpay.com/pl_*/view.
+	// pages.razorpay.com/pl_* without /view always returns a static error page.
+
+	canonical := targetURL
+
+	switch {
+	case strings.Contains(targetURL, "rzp.io/"):
+		// Follow the redirect to get the canonical URL, then continue normally.
+		// rzp.io/l/XXX  → pages.razorpay.com/pl_XXX/view  or  pages.razorpay.com/SLUG
+		// rzp.io/rzp/XX → same
+		// rzp.io/i/XX   → pages.razorpay.com/pl_XXX/view  (invoice)
+		redirResp, redirectErr := fetch.Get(targetURL, map[string]string{
 			"Accept":                    "text/html,application/xhtml+xml,*/*",
 			"Sec-Fetch-Dest":            "document",
 			"Sec-Fetch-Mode":            "navigate",
 			"Sec-Fetch-Site":            "none",
 			"Upgrade-Insecure-Requests": "1",
 		})
-		if err != nil {
-			return nil, classifyProxyError(err), fmt.Errorf("razorpay.me fetch: %w", err)
+		if redirectErr != nil {
+			return nil, classifyProxyError(redirectErr), fmt.Errorf("rzp.io redirect fetch: %w", redirectErr)
 		}
-		if resp.StatusCode == 402 || resp.StatusCode == 404 {
-			return nil, "LIVE", fmt.Errorf("Payment link expired/inactive (HTTP %d)", resp.StatusCode)
-		}
-		// Try to extract slug and hit the API
-		slug := ""
-		if idx := strings.Index(targetURL, "razorpay.me/"); idx != -1 {
-			rest := targetURL[idx+len("razorpay.me/"):]
-			rest = strings.TrimPrefix(rest, "@")
-			if idx2 := strings.IndexAny(rest, "/?"); idx2 != -1 {
-				rest = rest[:idx2]
-			}
-			slug = rest
-		}
-		if slug != "" {
-			apiURL := fmt.Sprintf("https://api.razorpay.com/v1/payment_links/%s?expand[]=payment_page_items", slug)
-			apiResp, err := fetch.Get(apiURL, map[string]string{
-				"Accept": "application/json",
-				"Origin": "https://razorpay.me",
-			})
-			if err == nil && apiResp.StatusCode == 200 {
-				var apiData map[string]interface{}
-				if json.Unmarshal(apiResp.Body, &apiData) == nil {
-					return buildInitDataFromLinkAPI(apiData, resp.Text()), "", nil
+		if redirectErr == nil && redirResp.StatusCode == 200 {
+			// The CustomFetch client follows redirects automatically (http.Client default).
+			// The final URL is stored in the response after following.
+			// Check if we got proper checkout data directly.
+			if d := tryExtractFromHTMLWithError(redirResp.Text()); d != nil {
+				if errObj, isErr := d["error"].(map[string]interface{}); isErr {
+					errCode := getStringFromMap(errObj, "code")
+					errMsg := getStringFromMap(errObj, "description")
+					if errMsg == "" { errMsg = errCode }
+					go markSiteDead(targetURL, sitesFilePath)
+					return nil, "LIVE", fmt.Errorf("rzp.io link %s: %s", errCode, errMsg)
 				}
+				if ec := getStringFromMap(d, "error_code"); ec != "" {
+					msg := getStringFromMap(d, "message")
+					if msg == "" { msg = ec }
+					go markSiteDead(targetURL, sitesFilePath)
+					return nil, "LIVE", fmt.Errorf("rzp.io link expired: %s", msg)
+				}
+				return d, "", nil
 			}
 		}
-		// Fall back to HTML extraction
-		if data := tryExtractFromHTML(resp.Text()); data != nil {
-			return data, "", nil
-		}
-		return nil, "LIVE", fmt.Errorf("Could not extract data from razorpay.me page (slug: %s)", slug)
-	}
+		return nil, "LIVE", fmt.Errorf("rzp.io link did not resolve to a checkout page (status %d)", redirResp.StatusCode)
 
-	// ── pl_* payment link IDs ─────────────────────────────────────────────────
-	//
-	// pages.razorpay.com/pl_* → always returns 1488-byte static error HTML.
-	// The canonical URL is razorpay.com/payment-link/pl_* which serves var data.
-	//
-	// Active link:  var data = {"key_id":"rzp_live_...", "payment_link":{...}}
-	// Expired link: var data = {"error":{"code":"invalid_id","description":"..."}}
-	//
-	// If var data is not found (some links use SPA/React), fall back to
-	// api.razorpay.com/v1/checkout/public?payment_link_id=pl_*
-	isPLID := (strings.Contains(targetURL, "pages.razorpay.com/pl_") ||
-		strings.Contains(targetURL, "razorpay.me/pl_") ||
-		strings.Contains(targetURL, "razorpay.com/payment-link/pl_"))
-	if isPLID {
-		plID := ""
+	case strings.Contains(targetURL, "razorpay.com/payment-link/"):
+		// razorpay.com/payment-link/pl_XXX → rewrite to pages.razorpay.com/pl_XXX/view
 		parsedPL, _ := url.Parse(targetURL)
 		if parsedPL != nil {
-			for _, seg := range strings.Split(strings.Trim(parsedPL.Path, "/"), "/") {
+			segs := strings.Split(strings.Trim(parsedPL.Path, "/"), "/")
+			for _, seg := range segs {
 				if strings.HasPrefix(seg, "pl_") {
-					plID = seg
+					canonical = "https://pages.razorpay.com/" + seg + "/view"
+					log.Printf("[url] razorpay.com/payment-link → %s", canonical)
 					break
 				}
 			}
 		}
-		if plID == "" {
-			return nil, "LIVE", fmt.Errorf("could not extract pl_* ID from URL: %s", targetURL)
-		}
 
-		correctURL := "https://razorpay.com/payment-link/" + plID
-		log.Printf("[pl_*] %s → %s", targetURL, correctURL)
-
-		respPL, errPL := fetch.Get(correctURL, map[string]string{
-			"Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-			"Sec-Fetch-Dest":            "document",
-			"Sec-Fetch-Mode":            "navigate",
-			"Sec-Fetch-Site":            "none",
-			"Sec-Fetch-User":            "?1",
-			"Upgrade-Insecure-Requests": "1",
-		})
-		if errPL != nil {
-			return nil, classifyProxyError(errPL), fmt.Errorf("pl_* page fetch: %w", errPL)
-		}
-		if respPL.StatusCode == 403 || respPL.StatusCode == 429 {
-			return nil, "BLOCKED", fmt.Errorf("WAF blocked pl_* fetch (HTTP %d)", respPL.StatusCode)
-		}
-
-		textPL := respPL.Text()
-
-		// tryExtractFromHTMLWithError: also returns pure-error objects so we
-		// can surface the exact "invalid_id" / "page_deactivated" message.
-		if rawData := tryExtractFromHTMLWithError(textPL); rawData != nil {
-			// Check if it's an error object (expired / deactivated link)
-			if errObj, isErrResp := rawData["error"].(map[string]interface{}); isErrResp {
-				errCode := getStringFromMap(errObj, "code")
-				errDesc := getStringFromMap(errObj, "description")
-				if errDesc == "" {
-					errDesc = errCode
+	case strings.Contains(targetURL, "pages.razorpay.com/pl_") &&
+		!strings.Contains(targetURL, "/view") &&
+		!strings.Contains(targetURL, "/view/"):
+		// pages.razorpay.com/pl_XXXXX → must append /view
+		// Strip any trailing slash first
+		base := strings.TrimRight(targetURL, "/")
+		// Extract pl_ id
+		parsedPLRaw, _ := url.Parse(base)
+		if parsedPLRaw != nil {
+			segs := strings.Split(strings.Trim(parsedPLRaw.Path, "/"), "/")
+			for _, seg := range segs {
+				if strings.HasPrefix(seg, "pl_") {
+					canonical = "https://pages.razorpay.com/" + seg + "/view"
+					log.Printf("[url] added /view: %s → %s", targetURL, canonical)
+					break
 				}
-				// Permanently dead — remove from sites file
-				go markSiteDead(targetURL, sitesFilePath)
-				return nil, "LIVE", fmt.Errorf("Payment link %s: %s", errCode, errDesc)
-			}
-			// Valid checkout data
-			return rawData, "", nil
-		}
-
-		// No var data in HTML — try checkout/public API (React SPA path)
-		checkoutAPIURL := fmt.Sprintf(
-			"https://api.razorpay.com/v1/checkout/public?payment_link_id=%s&traffic_env=production&new_session=1",
-			plID,
-		)
-		apiResp, apiErr := fetch.Get(checkoutAPIURL, map[string]string{
-			"Accept":  "application/json",
-			"Origin":  "https://razorpay.com",
-			"Referer": correctURL,
-		})
-		if apiErr == nil && apiResp.StatusCode == 200 {
-			var apiData map[string]interface{}
-			if json.Unmarshal(apiResp.Body, &apiData) == nil && len(apiData) > 0 {
-				// Check if API returned an error
-				if errObj, isErrResp := apiData["error"].(map[string]interface{}); isErrResp {
-					errCode := getStringFromMap(errObj, "code")
-					go markSiteDead(targetURL, sitesFilePath)
-					return nil, "LIVE", fmt.Errorf("checkout API: %s", errCode)
-				}
-				log.Printf("[pl_*] got data from checkout/public API for %s", plID)
-				return apiData, "", nil
 			}
 		}
-
-		// Both methods failed — could be a WAF/proxy issue, don't mark as dead
-		return nil, "LIVE", fmt.Errorf("var data not found in pl_* HTML (page len=%d)", len(textPL))
 	}
 
-	// ── Standard pages.razorpay.com/<slug> flow ─────────────────────────────
-	//
-	// Valid active pages serve: var data = {"key_id":"rzp_live_...", ...}
-	// Invalid/expired pages return the 1488-byte static error HTML.
-	// Some newer pages are React SPAs — no var data in HTML, need checkout API.
-	resp, err := fetch.Get(targetURL, map[string]string{
+	// ── Step 2: Fetch canonical URL ──────────────────────────────────────────
+
+	var origin string
+	switch {
+	case strings.Contains(canonical, "razorpay.me"):
+		origin = "https://razorpay.me"
+	case strings.Contains(canonical, "pages.razorpay.com"):
+		origin = "https://pages.razorpay.com"
+	default:
+		origin = "https://razorpay.com"
+	}
+
+	resp, err := fetch.Get(canonical, map[string]string{
 		"Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+		"Origin":                    origin,
 		"Sec-Fetch-Dest":            "document",
 		"Sec-Fetch-Mode":            "navigate",
 		"Sec-Fetch-Site":            "none",
@@ -1224,10 +1181,10 @@ func resolveRazorpayInitData(fetch *CustomFetch, targetURL string, proxyRaw stri
 		return nil, classifyProxyError(err), fmt.Errorf("page fetch: %w", err)
 	}
 
-	if resp.StatusCode == 403 || resp.StatusCode == 429 {
+	switch resp.StatusCode {
+	case 403, 429:
 		return nil, "BLOCKED", fmt.Errorf("WAF blocked page fetch (HTTP %d)", resp.StatusCode)
-	}
-	if resp.StatusCode == 404 {
+	case 404:
 		go markSiteDead(targetURL, sitesFilePath)
 		return nil, "LIVE", fmt.Errorf("Payment page not found (404)")
 	}
@@ -1237,50 +1194,115 @@ func resolveRazorpayInitData(fetch *CustomFetch, targetURL string, proxyRaw stri
 
 	text := resp.Text()
 
-	// Use WithError variant to also detect pure-error var data objects
-	if rawData := tryExtractFromHTMLWithError(text); rawData != nil {
-		if errObj, isErrResp := rawData["error"].(map[string]interface{}); isErrResp {
+	// ── Step 3: Parse var data ────────────────────────────────────────────────
+	//
+	// Use WithError variant to also capture {"error_code":...} and {"error":{...}}
+	// structures so we can surface correct error messages.
+
+	rawData := tryExtractFromHTMLWithError(text)
+	if rawData != nil {
+		// Case A: Razorpay error object — {"error":{"code":"invalid_id",...}}
+		if errObj, isErr := rawData["error"].(map[string]interface{}); isErr {
 			errCode := getStringFromMap(errObj, "code")
-			errDesc := getStringFromMap(errObj, "description")
-			if errDesc == "" { errDesc = errCode }
+			errMsg := getStringFromMap(errObj, "description")
+			if errMsg == "" { errMsg = getStringFromMap(errObj, "reason") }
+			if errMsg == "" { errMsg = errCode }
 			go markSiteDead(targetURL, sitesFilePath)
-			return nil, "LIVE", fmt.Errorf("Payment page %s: %s", errCode, errDesc)
+			return nil, "LIVE", fmt.Errorf("Payment page %s: %s", errCode, errMsg)
 		}
+
+		// Case B: Razorpay error_code object — {"error_code":"BAD_REQUEST_INVALID_ID","message":"..."}
+		// This is the format returned by pages.razorpay.com/pl_*/view for expired/deactivated links
+		if ec := getStringFromMap(rawData, "error_code"); ec != "" {
+			msg := getStringFromMap(rawData, "message")
+			if msg == "" { msg = ec }
+			// Only mark dead if it's truly expired/deactivated — not a transient error
+			if strings.Contains(strings.ToLower(ec), "invalid") ||
+				strings.Contains(strings.ToLower(msg), "deactivated") ||
+				strings.Contains(strings.ToLower(msg), "expired") {
+				go markSiteDead(targetURL, sitesFilePath)
+			}
+			return nil, "LIVE", fmt.Errorf("Payment page error: %s", msg)
+		}
+
+		// Case C: razorpay.me — try API fallback for better data if key_id is missing
+		if strings.Contains(canonical, "razorpay.me/") {
+			slug := ""
+			if idx := strings.Index(canonical, "razorpay.me/"); idx != -1 {
+				rest := canonical[idx+len("razorpay.me/"):]
+				rest = strings.TrimPrefix(rest, "@")
+				if idx2 := strings.IndexAny(rest, "/?"); idx2 != -1 {
+					rest = rest[:idx2]
+				}
+				slug = rest
+			}
+			if slug != "" && getStringFromMap(rawData, "key_id") == "" {
+				apiURL := fmt.Sprintf("https://api.razorpay.com/v1/payment_links/%s?expand[]=payment_page_items", slug)
+				apiResp, apiErr := fetch.Get(apiURL, map[string]string{
+					"Accept": "application/json",
+					"Origin": "https://razorpay.me",
+				})
+				if apiErr == nil && apiResp.StatusCode == 200 {
+					var apiData map[string]interface{}
+					if json.Unmarshal(apiResp.Body, &apiData) == nil && len(apiData) > 0 {
+						if _, isErr := apiData["error"].(map[string]interface{}); !isErr {
+							merged := buildInitDataFromLinkAPI(apiData, text)
+							// Preserve keyless_header from HTML var data
+							if kh := getStringFromMap(rawData, "keyless_header"); kh != "" {
+								merged["keyless_header"] = kh
+							}
+							return merged, "", nil
+						}
+					}
+				}
+			}
+		}
+
+		// Case D: Valid checkout data — return as-is
 		return rawData, "", nil
 	}
 
-	// Static 1488-byte error page = "URL not found" → dead site
+	// ── Step 4: No var data in HTML ───────────────────────────────────────────
+	//
+	// Small page (≤1600 bytes) = static error HTML = dead site
 	if len(text) <= 1600 {
 		go markSiteDead(targetURL, sitesFilePath)
-		return nil, "LIVE", fmt.Errorf("Payment page not found (invalid slug, page len=%d)", len(text))
+		return nil, "LIVE", fmt.Errorf("Payment page not found (invalid/dead, page len=%d)", len(text))
 	}
 
-	// Larger page with no var data — might be React SPA
-	// Try checkout/public API as fallback
-	parsedFB, _ := url.Parse(targetURL)
-	var slugFB string
-	if parsedFB != nil {
-		segs := strings.Split(strings.Trim(parsedFB.Path, "/"), "/")
-		if len(segs) > 0 {
-			slugFB = segs[len(segs)-1]
+	// Larger page with no var data — React SPA. Try checkout/public API.
+	var spaID string
+	parsedSPA, _ := url.Parse(canonical)
+	if parsedSPA != nil {
+		segs := strings.Split(strings.Trim(parsedSPA.Path, "/"), "/")
+		// Use last meaningful segment (skip "view")
+		for i := len(segs) - 1; i >= 0; i-- {
+			if segs[i] != "" && segs[i] != "view" {
+				spaID = segs[i]
+				break
+			}
 		}
 	}
-	if slugFB != "" {
-		fbAPIURL := fmt.Sprintf(
-			"https://api.razorpay.com/v1/checkout/public?payment_page_id=%s&traffic_env=production&new_session=1",
-			slugFB,
+	if spaID != "" {
+		paramKey := "payment_page_id"
+		if strings.HasPrefix(spaID, "pl_") {
+			paramKey = "payment_link_id"
+		}
+		spaURL := fmt.Sprintf(
+			"https://api.razorpay.com/v1/checkout/public?%s=%s&traffic_env=production&new_session=1",
+			paramKey, spaID,
 		)
-		fbResp, fbErr := fetch.Get(fbAPIURL, map[string]string{
+		spaResp, spaErr := fetch.Get(spaURL, map[string]string{
 			"Accept":  "application/json",
-			"Origin":  "https://pages.razorpay.com",
-			"Referer": targetURL,
+			"Origin":  origin,
+			"Referer": canonical,
 		})
-		if fbErr == nil && fbResp.StatusCode == 200 {
-			var fbData map[string]interface{}
-			if json.Unmarshal(fbResp.Body, &fbData) == nil && len(fbData) > 0 {
-				if _, isErr := fbData["error"].(map[string]interface{}); !isErr {
-					log.Printf("[pages] SPA fallback checkout/public succeeded for %s", slugFB)
-					return fbData, "", nil
+		if spaErr == nil && spaResp.StatusCode == 200 {
+			var spaData map[string]interface{}
+			if json.Unmarshal(spaResp.Body, &spaData) == nil && len(spaData) > 0 {
+				if _, isErr := spaData["error"].(map[string]interface{}); !isErr {
+					log.Printf("[spa] checkout/public API succeeded for %s", spaID)
+					return spaData, "", nil
 				}
 			}
 		}
@@ -1288,6 +1310,7 @@ func resolveRazorpayInitData(fetch *CustomFetch, targetURL string, proxyRaw stri
 
 	return nil, "LIVE", fmt.Errorf("var data not found in page HTML (page len=%d)", len(text))
 }
+
 
 func tryExtractFromHTML(html string) map[string]interface{} {
 	patterns := []string{"data", "__INITIAL_DATA__", "__rzp_config__", "rzpConfig", "pageConfig",
